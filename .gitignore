@@ -1,0 +1,30 @@
+# Gradle and Android
+.gradle/
+**/build/
+.cxx/
+.externalNativeBuild/
+local.properties
+*.apk
+*.apks
+*.aab
+
+# IDE and OS files
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Local settings and signing
+.env
+.env.*
+*.jks
+*.keystore
+keystore.properties
+signing.properties
+
+# Device captures and diagnostics
+/captures/
+/screenshots/
+*.log
+*.hprof

@@ -1,0 +1,35 @@
+plugins {
+    id 'com.android.application' version '8.13.2'
+}
+
+android {
+    namespace 'dev.wfassistant.mobile'
+    compileSdk 36
+
+    defaultConfig {
+        applicationId 'dev.wfassistant.mobile'
+        minSdk 34
+        targetSdk 36
+        versionCode 17
+        versionName '0.4.10'
+    }
+
+    buildFeatures {
+        aidl true
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    implementation 'dev.rikka.shizuku:api:13.1.5'
+    implementation 'dev.rikka.shizuku:provider:13.1.5'
+    compileOnly 'androidx.annotation:annotation:1.3.0'
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
