@@ -10,11 +10,14 @@ interface ISurvivalSession {
     int phase() = 3;
     void touch(int action, in int[] ids, in float[] xs, in float[] ys) = 4;
     void closeGame() = 5;
-    void startSurvival(int relicLimit) = 6;
+    void startSurvival(boolean relicEnabled, int relicLimit, String macroJson) = 6;
     void stopSurvival() = 7;
     boolean saveScreenshot(in ParcelFileDescriptor output) = 8;
     void setPreviewSurface(in Surface surface, int width, int height) = 9;
     boolean isGameVibrationMuted() = 10;
     boolean setGameVibrationMuted(boolean muted) = 11;
+    boolean isGameAudioMuted() = 12;
+    boolean setGameAudioMuted(boolean muted) = 13;
+    String taskLog() = 14;
     void destroy() = 16777114;
 }

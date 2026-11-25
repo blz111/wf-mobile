@@ -16,12 +16,18 @@ import android.util.Log;
 import android.view.Display;
 import android.view.InputDevice;
 import android.view.InputEvent;
+import android.view.KeyCharacterMap;
+import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.Surface;
 
 import java.io.IOException;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
+import java.time.LocalTime;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.ScheduledFuture;
@@ -30,19 +36,18 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Pattern;
 
+import org.json.JSONObject;
+
 public final class VirtualGameSession extends ISurvivalSession.Stub {
     static final int SHELL_UID = 2000;
     static final int CLOSED = 0, OPENING = 1, READY = 2, RUNNING = 3;
     static final int WIDTH = 1280, HEIGHT = 720;
-    private static final int RELIC_SCAN_INTERVAL_MS = 5_000;
-    private static final int CONFIRM_SCAN_INTERVAL_MS = 300;
-    private static final int CONFIRM_TIMEOUT_MS = 4_000;
     private static final int MANUAL_TOUCH_SETTLE_MS = 250;
     private static final int GAME_TASK_WATCH_MS = 1_500;
     private static final int ALWAYS_UNLOCKED = 1 << 12;
     private static final int DISPLAY_ALWAYS_UNLOCKED = 1 << 9;
     private static final String GAME = "com.digitalextremes.warframemobile";
-    private static final Pattern VIBRATION_MODE = Pattern.compile("(?m)^\\s*(?:VIBRATE:|Default mode:)\\s*(\\w+)");
+    private static final DateTimeFormatter LOG_TIME = DateTimeFormatter.ofPattern("HH:mm:ss");
     private static final ComponentName GOOGLE_CHOOSER = new ComponentName("com.google.android.gms",
             "com.google.android.gms.auth.api.credentials.assistedsignin.ui.GoogleSignInActivity");
     private static final int DISPLAY_FLAGS = DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC
@@ -58,7 +63,7 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
     private final Context shellContext;
     private final ScheduledThreadPoolExecutor worker = new ScheduledThreadPoolExecutor(1);
     private final AtomicInteger queuedManualTouches = new AtomicInteger();
-    private final SurvivalRecognition recognition = new SurvivalRecognition();
+    private final ArrayDeque<String> log = new ArrayDeque<>();
     private volatile String message = "Shizuku 已连接";
     private volatile int phase = CLOSED;
     private VirtualDisplay display;
@@ -75,12 +80,7 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
     private ScheduledFuture<?> pending;
     private ScheduledFuture<?> powerKeepAlive;
     private ScheduledFuture<?> gameTaskWatch;
-    private boolean waitingForRelicsToClose;
-    private boolean countRelicOnClose;
-    private boolean waitingForManualRelease;
-    private int relicLimit;
-    private long equippedRelics;
-    private long confirmationDeadline;
+    private GameTaskScheduler taskScheduler;
     private long lastManualTouch;
     private long gestureStart;
     private int[] activeIds;
@@ -101,36 +101,49 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
     @Override public String status() { return message; }
     @Override public int phase() { return phase; }
 
-    @Override public boolean isGameVibrationMuted() {
+    @Override public synchronized String taskLog() { return String.join("\n", log); }
+
+    private synchronized void logEvent(String message) {
+        if (log.size() == 120) log.removeFirst();
+        log.addLast(LocalTime.now().format(LOG_TIME) + "  " + message);
+    }
+
+    @Override public boolean isGameVibrationMuted() { return gameOpMuted("VIBRATE"); }
+    @Override public boolean setGameVibrationMuted(boolean muted) { return setGameOpMuted("VIBRATE", muted); }
+    @Override public boolean isGameAudioMuted() { return gameOpMuted("PLAY_AUDIO"); }
+    @Override public boolean setGameAudioMuted(boolean muted) { return setGameOpMuted("PLAY_AUDIO", muted); }
+
+    private static boolean gameOpMuted(String op) {
         try {
-            return readGameVibrationMuted(currentUser());
+            return readGameOpMuted(currentUser(), op);
         } catch (Exception error) {
-            throw new IllegalStateException("读取 Warframe 震动设置失败", error);
+            throw new IllegalStateException("读取 Warframe " + op + " 设置失败", error);
         }
     }
 
-    @Override public boolean setGameVibrationMuted(boolean muted) {
+    private boolean setGameOpMuted(String op, boolean muted) {
         try {
             String user = currentUser();
-            command("/system/bin/cmd", "appops", "set", "--user", user, GAME, "VIBRATE",
+            command("/system/bin/cmd", "appops", "set", "--user", user, GAME, op,
                     muted ? "ignore" : "allow");
-            if (readGameVibrationMuted(user) != muted) {
-                throw new IOException("Android 未应用震动设置");
+            if (readGameOpMuted(user, op) != muted) {
+                throw new IOException("Android 未应用 " + op + " 设置");
             }
+            logEvent((muted ? "已关闭游戏" : "已恢复游戏") + ("VIBRATE".equals(op) ? "震动" : "声音"));
             return muted;
         } catch (Exception error) {
-            throw new IllegalStateException("修改 Warframe 震动设置失败", error);
+            throw new IllegalStateException("修改 Warframe " + op + " 设置失败", error);
         }
     }
 
-    private static boolean readGameVibrationMuted(String user) throws Exception {
-        String result = command("/system/bin/cmd", "appops", "get", "--user", user, GAME, "VIBRATE");
-        var mode = VIBRATION_MODE.matcher(result);
-        if (!mode.find()) throw new IOException("系统未返回 Warframe 震动状态");
+    private static boolean readGameOpMuted(String user, String op) throws Exception {
+        String result = command("/system/bin/cmd", "appops", "get", "--user", user, GAME, op);
+        var mode = Pattern.compile("(?m)^\\s*(?:" + op + ":|Default mode:)\\s*(\\w+)").matcher(result);
+        if (!mode.find()) throw new IOException("系统未返回 Warframe " + op + " 状态");
         return switch (mode.group(1)) {
             case "ignore", "deny", "errored" -> true;
             case "allow", "default", "foreground" -> false;
-            default -> throw new IOException("未知震动状态 · " + mode.group(1));
+            default -> throw new IOException("未知 " + op + " 状态 · " + mode.group(1));
         };
     }
 
@@ -240,6 +253,7 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
                 trackGameTask(task, id);
                 phase = READY;
                 message = "Warframe 已在虚拟屏打开";
+                logEvent(message);
                 gameTaskWatch = worker.scheduleWithFixedDelay(() -> watchGameTask(id),
                         GAME_TASK_WATCH_MS, GAME_TASK_WATCH_MS, TimeUnit.MILLISECONDS);
             } else if (SystemClock.uptimeMillis() < deadline) {
@@ -364,6 +378,7 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
                     return;
                 }
                 if (masked != MotionEvent.ACTION_DOWN && activeIds == null) return;
+                if (masked == MotionEvent.ACTION_DOWN && taskScheduler != null) taskScheduler.pauseNormalTasks();
                 int targetUid = masked == MotionEvent.ACTION_DOWN ? manualTargetUid() : gestureUid;
                 sendTouch(action, ids, xs, ys, targetUid);
                 if (masked == MotionEvent.ACTION_DOWN && phase == READY) message = targetUid == gameUid
@@ -383,98 +398,108 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
         });
     }
 
-    @Override public void startSurvival(int limit) {
+    @Override public void startSurvival(boolean relicEnabled, int limit, String macroJson) {
         worker.execute(() -> {
             if (phase != READY) return;
             if (limit < 0) {
                 message = "开核桃数需要是非负整数";
                 return;
             }
-            relicLimit = limit;
-            equippedRelics = 0;
-            waitingForRelicsToClose = false;
-            countRelicOnClose = false;
-            waitingForManualRelease = false;
-            confirmationDeadline = 0;
-            phase = RUNNING;
-            scan();
+            try {
+                List<GameTaskScheduler.Task> tasks = new ArrayList<>();
+                if (relicEnabled) tasks.add(new RelicTask(limit));
+                if (macroJson != null && !macroJson.isBlank()) {
+                    SkillMacro macro = SkillMacro.fromJson(new JSONObject(macroJson));
+                    tasks.add(new MacroTask(macro, worker, new MacroInput(), this::logEvent, this::failTasks));
+                }
+                if (tasks.isEmpty()) return;
+                taskScheduler = new GameTaskScheduler(tasks);
+                phase = RUNNING;
+                List<String> progress = new ArrayList<>();
+                for (GameTaskScheduler.Task task : tasks) progress.add(task.progress());
+                logEvent("开始任务 · " + String.join(" · ", progress));
+                scan();
+            } catch (Exception error) {
+                failTasks(error);
+            }
         });
+    }
+
+    private final class MacroInput implements MacroTask.Input {
+        private long downTime;
+
+        @Override public boolean isIdle() { return !manualTouchActive(); }
+
+        @Override public boolean press(SkillMacro.Action action) throws Exception {
+            if (phase != RUNNING || !isIdle()) return false;
+            checkTarget();
+            switch (action.kind()) {
+                case GAMEPAD -> {
+                    downTime = SystemClock.uptimeMillis();
+                    sendGamepad(KeyEvent.ACTION_DOWN, action.key(), downTime);
+                }
+                case JOYSTICK -> sendJoystick(action.stick(), action.direction().x, action.direction().y);
+                case TAP, HOLD -> sendPoint(MotionEvent.ACTION_DOWN, new Point(action.x(), action.y()));
+                case WAIT -> throw new IllegalArgumentException("等待动作无需发送输入");
+            }
+            return true;
+        }
+
+        @Override public void release(SkillMacro.Action action) throws Exception {
+            switch (action.kind()) {
+                case GAMEPAD -> sendGamepad(KeyEvent.ACTION_UP, action.key(), downTime);
+                case JOYSTICK -> sendJoystick(action.stick(), 0, 0);
+                case TAP, HOLD -> sendPoint(MotionEvent.ACTION_UP, new Point(action.x(), action.y()));
+                case WAIT -> throw new IllegalArgumentException("等待动作无需发送输入");
+            }
+        }
     }
 
     private void scan() {
         pending = null;
-        if (waitingForManualRelease && manualTouchActive()) {
-            pending = worker.schedule(this::scan, CONFIRM_SCAN_INTERVAL_MS, TimeUnit.MILLISECONDS);
+        GameTaskScheduler scheduler = taskScheduler;
+        if (scheduler == null) return;
+        if (scheduler.waitingForRelease() && manualTouchActive()) {
+            pending = worker.schedule(this::scan, GameTaskScheduler.INTERACTION_INTERVAL_MS, TimeUnit.MILLISECONDS);
             return;
         }
-        waitingForManualRelease = false;
         Bitmap screenshot = null;
         try {
             int id = display.getDisplay().getDisplayId();
             if (findGameTask(id, false) == null && restoreMovedTask(id)) {
+                scheduler.pauseNormalTasks();
                 pending = worker.schedule(this::scan, 700, TimeUnit.MILLISECONDS);
                 return;
             }
             checkTarget();
             screenshot = copyFrame();
-            int delay = RELIC_SCAN_INTERVAL_MS;
-            if (confirmationDeadline != 0) {
-                if (screenshot != null && recognition.relicConfirmation(screenshot)) {
-                    if (tapWhenIdle(new Point(505, 402))) {
-                        confirmationDeadline = 0;
-                        waitingForRelicsToClose = true;
-                        countRelicOnClose = true;
-                        survivalMessage("已点击确认装备核桃");
-                    } else {
-                        delay = CONFIRM_SCAN_INTERVAL_MS;
-                        survivalMessage("等待松手后确认装备核桃");
-                    }
-                } else if (SystemClock.uptimeMillis() >= confirmationDeadline) {
-                    confirmationDeadline = 0;
-                    waitingForRelicsToClose = true;
-                    survivalMessage("未识别到核桃确认框 · 等待页面关闭");
-                } else {
-                    delay = CONFIRM_SCAN_INTERVAL_MS;
-                }
-            } else if (waitingForRelicsToClose) {
-                if (screenshot != null && !recognition.relicSelection(screenshot)
-                        && !recognition.relicConfirmation(screenshot)) {
-                    waitingForRelicsToClose = false;
-                    if (countRelicOnClose) {
-                        countRelicOnClose = false;
-                        equippedRelics++;
-                        if (relicLimit > 0 && equippedRelics >= relicLimit) {
-                            survivalMessage("已达到开核桃数，停止检测");
-                            phase = READY;
-                            return;
-                        }
-                    }
-                    survivalMessage("等待选核桃页面");
-                }
-            } else if (screenshot != null && recognition.relicSelection(screenshot)) {
-                delay = CONFIRM_SCAN_INTERVAL_MS;
-                if (tapWhenIdle(new Point(809, 606))) {
-                    confirmationDeadline = SystemClock.uptimeMillis() + CONFIRM_TIMEOUT_MS;
-                    survivalMessage("已点击装备以执行任务 · 等待确认框");
-                } else {
-                    survivalMessage("等待松手后装备核桃");
-                }
-            } else {
-                survivalMessage("等待选核桃页面");
+            GameTaskScheduler.State previous = scheduler.state();
+            GameTaskScheduler.Tick tick = scheduler.runFrame(screenshot, this::tapWhenIdle);
+            if (previous != scheduler.state()) logEvent(scheduler.state() == GameTaskScheduler.State.NORMAL
+                    ? "返回普通状态" : "识别到选核桃页面");
+            if (tick.status() != null && !tick.status().equals(message)) {
+                message = tick.status();
+                if (!message.startsWith("等待选核桃页面") && !message.startsWith("普通状态")) logEvent(message);
             }
-            pending = worker.schedule(this::scan, delay, TimeUnit.MILLISECONDS);
+            if (tick.finished()) {
+                taskScheduler = null;
+                phase = READY;
+                return;
+            }
+            pending = worker.schedule(this::scan, tick.delayMs(), TimeUnit.MILLISECONDS);
         } catch (Exception error) {
-            phase = READY;
-            report(error);
+            failTasks(error);
         } finally {
             if (screenshot != null) screenshot.recycle();
         }
     }
 
-    private void survivalMessage(String status) {
-        String progress = relicLimit == 0 ? "已装备 " + equippedRelics + " 个"
-                : "开核桃 " + equippedRelics + "/" + relicLimit;
-        message = status + " · " + progress;
+    private void failTasks(Exception error) {
+        cancelPending();
+        clearTasks();
+        cancelTouches();
+        if (phase == RUNNING) phase = READY;
+        report(error);
     }
 
     private void checkTarget() throws Exception {
@@ -526,10 +551,7 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
     }
 
     private boolean tapWhenIdle(Point point) throws Exception {
-        if (manualTouchActive()) {
-            waitingForManualRelease = true;
-            return false;
-        }
+        if (manualTouchActive()) return false;
         try {
             sendPoint(MotionEvent.ACTION_DOWN, point);
             SystemClock.sleep(45);
@@ -582,12 +604,6 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
     }
 
     private void emitTouch(int action, int[] ids, float[] xs, float[] ys) throws Exception {
-        if (inputManager == null) {
-            Class<?> type = Class.forName("android.hardware.input.InputManagerGlobal");
-            injectEvent = type.getMethod("injectInputEvent", InputEvent.class, int.class, int.class);
-            setDisplayId = InputEvent.class.getMethod("setDisplayId", int.class);
-            inputManager = type.getMethod("getInstance").invoke(null);
-        }
         int masked = action & MotionEvent.ACTION_MASK;
         int lifted = masked == MotionEvent.ACTION_POINTER_UP
                 ? (action & MotionEvent.ACTION_POINTER_INDEX_MASK) >> MotionEvent.ACTION_POINTER_INDEX_SHIFT : -1;
@@ -610,12 +626,53 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
         MotionEvent event = MotionEvent.obtain(gestureStart, SystemClock.uptimeMillis(), action, ids.length,
                 pointers, positions, 0, 0, 1, 1, 0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0);
         try {
-            setDisplayId.invoke(event, display.getDisplay().getDisplayId());
-            if (!Boolean.TRUE.equals(injectEvent.invoke(inputManager, event, 1, gestureUid))) {
-                throw new IOException("Android 拒绝了当前窗口的触摸事件");
-            }
+            injectToGame(event, gestureUid);
         } finally {
             event.recycle();
+        }
+    }
+
+    private void sendGamepad(int action, int key, long downTime) throws Exception {
+        KeyEvent event = new KeyEvent(downTime, SystemClock.uptimeMillis(), action, key,
+                0, 0, KeyCharacterMap.VIRTUAL_KEYBOARD, 0, 0, InputDevice.SOURCE_GAMEPAD);
+        injectToGame(event, gameUid);
+    }
+
+    private void sendJoystick(SkillMacro.Stick stick, float x, float y) throws Exception {
+        MotionEvent.PointerProperties pointer = new MotionEvent.PointerProperties();
+        pointer.id = 0;
+        pointer.toolType = MotionEvent.TOOL_TYPE_UNKNOWN;
+        MotionEvent.PointerCoords axes = new MotionEvent.PointerCoords();
+        if (stick == SkillMacro.Stick.LEFT) {
+            axes.setAxisValue(MotionEvent.AXIS_X, x);
+            axes.setAxisValue(MotionEvent.AXIS_Y, y);
+        } else {
+            axes.setAxisValue(MotionEvent.AXIS_Z, x);
+            axes.setAxisValue(MotionEvent.AXIS_RZ, y);
+        }
+        long now = SystemClock.uptimeMillis();
+        MotionEvent event = MotionEvent.obtain(now, now, MotionEvent.ACTION_MOVE, 1,
+                new MotionEvent.PointerProperties[]{pointer}, new MotionEvent.PointerCoords[]{axes},
+                0, 0, 1, 1, KeyCharacterMap.VIRTUAL_KEYBOARD, 0, InputDevice.SOURCE_JOYSTICK, 0);
+        try {
+            injectToGame(event, gameUid);
+        } finally {
+            event.recycle();
+        }
+    }
+
+    private void injectToGame(InputEvent event, int targetUid) throws Exception {
+        if (inputManager == null) {
+            Class<?> type = Class.forName("android.hardware.input.InputManagerGlobal");
+            injectEvent = type.getMethod("injectInputEvent", InputEvent.class, int.class, int.class);
+            setDisplayId = InputEvent.class.getMethod("setDisplayId", int.class);
+            inputManager = type.getMethod("getInstance").invoke(null);
+        }
+        setDisplayId.invoke(event, display.getDisplay().getDisplayId());
+        if (!Boolean.TRUE.equals(injectEvent.invoke(inputManager, event, 1, targetUid))) {
+            String input = event instanceof KeyEvent ? "手柄按键"
+                    : event.isFromSource(InputDevice.SOURCE_JOYSTICK) ? "手柄摇杆事件" : "触摸事件";
+            throw new IOException("Android 拒绝了" + input);
         }
     }
 
@@ -634,10 +691,10 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
         worker.execute(() -> {
             if (phase != RUNNING) return;
             cancelPending();
-            waitingForManualRelease = false;
-            confirmationDeadline = 0;
+            message = taskScheduler.stopMessage();
+            clearTasks();
             phase = READY;
-            survivalMessage("生存任务已停止");
+            logEvent(message);
         });
     }
 
@@ -645,6 +702,7 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
         worker.execute(() -> {
             release();
             message = "游戏已关闭";
+            logEvent(message);
         });
     }
 
@@ -664,6 +722,18 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
         pending = null;
     }
 
+    private void clearTasks() {
+        GameTaskScheduler active = taskScheduler;
+        taskScheduler = null;
+        if (active == null) return;
+        try {
+            active.pauseNormalTasks();
+        } catch (Exception error) {
+            Log.w("WarframeSurvival", "Could not release macro input", error);
+            logEvent("释放宏输入失败");
+        }
+    }
+
     private void release() {
         cancelPending();
         if (powerKeepAlive != null) powerKeepAlive.cancel(false);
@@ -672,11 +742,8 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
         gameTaskWatch = null;
         trackedTaskId = recentsHandledTaskId = -1;
         lastTaskMove = 0;
+        clearTasks();
         cancelTouches();
-        confirmationDeadline = 0;
-        waitingForRelicsToClose = false;
-        countRelicOnClose = false;
-        waitingForManualRelease = false;
         phase = CLOSED;
         if (display != null) display.release();
         display = null;
@@ -713,5 +780,6 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
         while (cause.getCause() != null && cause.getCause() != cause) cause = cause.getCause();
         String detail = cause.getMessage();
         message = "操作失败 · " + (detail == null || detail.isBlank() ? cause.getClass().getSimpleName() : detail);
+        logEvent(message);
     }
 }

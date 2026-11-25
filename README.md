@@ -2,58 +2,120 @@
 
 # Warframe 生存
 
-**通过 Shizuku 在 Android 虚拟屏上运行 Warframe，预览画面并自动确认遗物。**
+**用 Shizuku 在 Android 虚拟屏上运行 Warframe，手动操作游戏、自动确认遗物，并执行自定义技能宏。**
 
-[运行要求](#运行要求) · [使用指南](#使用指南) · [源码构建](#源码构建) · [问题反馈](https://github.com/blz111/wf-mobile/issues)
+[快速开始](#快速开始) · [一键挂机](#一键挂机) · [宏配置](#宏配置) · [源码构建](#源码构建) · [问题反馈](https://github.com/blz111/wf-mobile/issues)
 
 </div>
 
-## 功能
-
-| 功能 | 说明 |
-| --- | --- |
-| 虚拟屏 | 将 Warframe 启动到 1280 × 720 的独立虚拟屏。主屏锁定时，后台续跑取决于设备系统和 Shizuku 权限。 |
-| GPU 预览 | 主页面显示小屏，轻触可放大到横屏。放大后可手动操作，支持多指触摸。 |
-| 识别核桃 | 每 5 秒检查遗物选择页，装备当前选中的遗物，再识别并确认装备弹窗。 |
-| 手动优先 | 自动点击前会等所有手指抬起，再重新检查画面。 |
-| 开核桃数 | 可设置本次检测的数量上限。确认装备且页面关闭后记 1 次，达标后结束检测。 |
-| 截图与震动 | 保存原尺寸 PNG，或单独关闭和恢复 Warframe 的震动。 |
-
-## 运行要求
+## 快速开始
 
 | 项目 | 要求 |
 | --- | --- |
-| Android | Android 14 或以上（API 34+） |
-| Shizuku | 13 或以上，通过无线调试或 ADB 启动，并授权给助手 |
-| Warframe | 安装 Android 版，识别使用简体中文界面 |
+| 手机 | Android 14 或以上 |
+| Shizuku | 13 或以上，通过无线调试或电脑 ADB 启动 |
+| 游戏 | 安装 Android 版 Warframe。使用识别核桃时，将游戏界面设为简体中文 |
 
-## 使用指南
+1. 安装助手 APK，启动 Shizuku。具体配对步骤见 [Shizuku 使用手册](https://shizuku.rikka.app/guide/setup/)。
+2. 打开助手，在 **一键挂机 → 快捷选项** 里点 **连接 Shizuku** 并授权，再点 **启动游戏**。
+3. 游戏会显示在应用顶部的预览里。轻触小屏进入横屏，可用多指手动操作。点右上角的小叉返回竖屏。
+4. 手动进入要运行任务的游戏场景。在 **一键挂机** 勾选任务，点任务名称调整右侧配置，然后点 **开始任务**。
 
-1. 安装助手 APK。打开应用，点 **连接 Shizuku** 完成授权。
-2. 点 **启动 Warframe**。轻触小屏可放大并手动操作，点右上角小叉回到主页面。
-3. 勾选 **识别核桃**。需要限制数量时，填写 **开核桃数**，填 0 表示不限。
-4. 点 **开始任务**。助手在看到 **装备以执行任务** 时点击它，确认框出现后再点 **是**。
-5. 点 **停止** 可随时结束页面检测。点 **关闭游戏** 会结束虚拟屏上的游戏并释放虚拟屏。
+### 快捷选项
 
-主页面的 **保存截图** 会将 1280 × 720 PNG 保存到相册的 `Pictures/WarframeSurvival`。**关闭游戏震动** 只修改 Warframe 的震动设置，再点 **恢复游戏震动** 可重新启用。
+| 操作 | 效果 |
+| --- | --- |
+| 启动游戏 | 把 Warframe 打开到固定为 1280 × 720 的独立虚拟屏 |
+| 关闭游戏 | 结束当前运行的任务并释放虚拟屏 |
+| 关闭／恢复声音 | 切换 Warframe 的声音 |
+| 关闭／恢复震动 | 切换 Warframe 的震动 |
+| 截图 | 保存原尺寸 PNG，可在相册或 `Pictures/WarframeSurvival` 找到 |
+
+游戏预览通过 GPU 渲染。锁屏和切到其他应用后的运行情况取决于手机系统对虚拟屏的支持及 Shizuku 服务状态。
+
+## 一键挂机
+
+| 任务 | 配置与行为 |
+| --- | --- |
+| **识别核桃** | 识别右下角的 **装备以执行任务**，点击后等待确认框，再点 **是**。确认并退出页面后计 1 个。**开核桃数** 设为 `0` 表示不限，达到设定数量后结束这项任务。 |
+| **技能宏** | 选择一个已保存的宏。在普通状态从第一步按顺序执行，最后一步结束后从头继续。 |
+
+两项任务可以单独勾选，也可以一起运行。点 **停止任务** 可结束本次运行。
+
+### 任务如何切换
+
+调度器使用同一份虚拟屏画面判断当前状态。单独运行核桃识别时，等待页面的检查间隔为 5 秒。运行技能宏时，检查间隔为 300 毫秒，以便及时切换状态。
+
+| 状态 | 调度行为 |
+| --- | --- |
+| **普通状态** | 持续检查画面。已勾选的技能宏在这个状态执行。 |
+| **选核桃状态** | 识别到选核桃页或装备确认框后，停止宏动作并释放宏按住的触点或按键。勾选了识别核桃时，由它处理装备和确认。页面关闭后回到普通状态，宏从第一步重新执行。 |
+
+手动触摸优先。自动点击核桃前会等你松手并重新检查页面。手动触摸也会中断正在执行的宏动作，抬手后由调度器继续。
+
+**日志** 页可查看当前服务最近 120 条事件，包括任务启停、状态切换、核桃处理、手柄事件提交与错误详情。
+
+## 宏配置
+
+1. 打开 **宏配置**，点 **新建** 或从宏库选择已有宏。
+2. 填写宏名称，再按顺序添加动作。点动作可编辑，右侧菜单可上移、下移或删除。
+3. 点 **保存宏**，回到 **一键挂机 → 技能宏** 选择它。
+
+| 动作 | 配置 |
+| --- | --- |
+| **触屏点按** | 输入坐标，或从放大的游戏预览取点。编辑器默认按住 45 毫秒。 |
+| **触屏长按** | 选择坐标并设定按住时长。 |
+| **等待** | 设定执行下一步前的延迟。 |
+| **手柄按键** | 选择按键及按住时长，例如 A、B、肩键、摇杆按下或方向键。 |
+| **手柄摇杆** | 选择左摇杆或右摇杆、上下左右方向和推住时长。动作结束或中断时回中。 |
+
+触屏坐标以虚拟屏左上角为原点，`x` 范围为 `0–1279`，`y` 范围为 `0–719`。从预览取点时，点选动作只填写坐标。
+
+### 导入与导出 JSON
+
+- **导入 JSON** 打开输入框，可直接粘贴单个宏对象，也可粘贴包含多个宏对象的数组。应用先校验动作类型与参数，再保存到宏库。同名宏会加上编号。
+- **导出 JSON** 把当前编辑器里的宏复制到剪贴板，包括尚未保存的有效修改。可直接把复制的文本粘贴回导入框。
+
+下面的宏会将左摇杆上推 500 毫秒，再等待 1 秒。任务持续处于普通状态时会重复这两步。
+
+```json
+{
+  "name": "左摇杆上推",
+  "actions": [
+    { "type": "JOYSTICK", "stick": "LEFT", "direction": "UP", "ms": 500 },
+    { "type": "WAIT", "ms": 1000 }
+  ]
+}
+```
+
+| `type` | 除 `ms` 外的动作字段 |
+| --- | --- |
+| `TAP` / `HOLD` | 整数坐标 `x`、`y` |
+| `WAIT` | 无 |
+| `GAMEPAD` | `key`，例如 `"KEYCODE_BUTTON_A"` |
+| `JOYSTICK` | `stick` 为 `"LEFT"` 或 `"RIGHT"`，`direction` 为 `"UP"`、`"DOWN"`、`"LEFT"` 或 `"RIGHT"` |
+
+每个动作的 `ms` 都以整毫秒填写。`WAIT` 可填 `0`，其余动作需大于 `0`。每个宏需要名称及至少一个触屏或手柄动作。
 
 ## 源码构建
 
-准备 JDK 17 或以上和 Android SDK 36，并将 `ANDROID_HOME` 指向 SDK 目录。Windows PowerShell 下运行：
+准备 JDK 17 或 21 与 Android SDK 36，并设置 `ANDROID_HOME`。在项目根目录执行对应平台的命令。
 
 ```powershell
 .\gradlew.bat :app:assembleDebug
 ```
 
-调试 APK 生成在 `app/build/outputs/apk/debug/app-debug.apk`。Google Maven 访问受限时，可指定镜像：
-
-```powershell
-.\gradlew.bat :app:assembleDebug '-PandroidMavenMirror=https://maven.aliyun.com/repository/google'
+```sh
+./gradlew :app:assembleDebug
 ```
 
-## 实现参考
+调试包输出到 `app/build/outputs/apk/debug/app-debug.apk`。Google Maven 访问受限时，可在构建命令末尾加上 `-PandroidMavenMirror=https://maven.aliyun.com/repository/google`。
 
-- [MAA-Meow](https://github.com/Aliothmoon/MAA-Meow) 提供了 Shizuku 用户服务、虚拟屏、GPU 预览和触摸转发的实现参考。
-- [Shizuku](https://github.com/RikkaApps/Shizuku) 为助手提供经过用户授权的 Android 系统接口。
+## 反馈与参考
 
-Warframe 官方限制无人值守的自动游玩，可能对相关账号采取处罚。[Warframe 官方说明](https://support.warframe.com/hc/en-us/articles/200287090-How-to-deal-with-Cheaters-AFKing-trolling)
+反馈问题时，可附上手机型号、Android 和助手版本、所执行的任务、相关日志及截图。[提交问题](https://github.com/blz111/wf-mobile/issues)
+
+- 虚拟屏、Shizuku 用户服务、GPU 预览和触摸转发的实现参考了 [MAA-Meow](https://github.com/Aliothmoon/MAA-Meow)。
+- 应用通过用户授权的 Shizuku 服务调用 Android 系统接口。[Shizuku 项目](https://github.com/RikkaApps/Shizuku)
+
+Warframe 官方对第三方工具和无人值守的自动游玩有使用限制。[第三方软件说明](https://support.warframe.com/hc/en-us/articles/360030014351-Third-Party-Software-and-You) · [自动游玩与 AFK 说明](https://support.warframe.com/hc/en-us/articles/200287090-How-to-deal-with-Cheaters-AFKing-trolling)

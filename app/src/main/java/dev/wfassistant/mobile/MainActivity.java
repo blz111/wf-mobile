@@ -7,8 +7,10 @@ import android.content.ServiceConnection;
 import android.content.pm.ActivityInfo;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
+import android.graphics.Point;
 import android.graphics.Rect;
 import android.graphics.SurfaceTexture;
+import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -27,6 +29,9 @@ import android.view.TextureView;
 import android.view.View;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
+import android.window.OnBackInvokedCallback;
+import android.window.OnBackInvokedDispatcher;
+import android.widget.AdapterView;
 import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.EditText;
@@ -35,45 +40,60 @@ import android.widget.ImageButton;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.Spinner;
 import android.widget.TextView;
 import android.widget.Toast;
 
 import java.io.IOException;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Date;
+import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.function.Consumer;
 
 import rikka.shizuku.Shizuku;
 
 public final class MainActivity extends Activity {
     private static final int REQUEST_SHIZUKU = 1;
+    private static final int TASK_TAB = 0, MACRO_TAB = 1, LOG_TAB = 2;
+    private static final int INK = 0xff18312c, ACCENT = 0xff216958, PALE = 0xffe1eee8;
     private final Handler ui = new Handler(Looper.getMainLooper());
     private final ExecutorService statusWorker = Executors.newSingleThreadExecutor();
     private final ExecutorService screenshotWorker = Executors.newSingleThreadExecutor();
     private Shizuku.UserServiceArgs args;
     private ISurvivalSession session;
     private boolean bound, visible, polling, expanded, touching, saving, hasGameFrame;
-    private boolean vibrationBusy;
-    private Boolean vibrationMuted;
+    private final boolean[] feedbackBusy = new boolean[2];
+    private final Boolean[] feedbackMuted = new Boolean[2];
     private int phase = VirtualGameSession.CLOSED;
     private FrameLayout smallPreview, fullPreview;
     private ScrollView compact;
-    private TextView state;
+    private TextView state, taskLog, pickingHint;
     private TextureView preview;
     private Surface previewSurface;
     private int previewWidth, previewHeight;
-    private Button authorize, launch, close, start, stop, screenshot, vibration;
-    private CheckBox relicTask;
+    private Button authorize, launch, close, start, screenshot, vibration, audio, quickOptions;
+    private final Button[] tabs = new Button[3];
+    private final LinearLayout[] panels = new LinearLayout[3];
+    private LinearLayout relicSettings, macroSettings, quickPanel, footer;
+    private TextView relicLabel, macroLabel;
+    private CheckBox relicTask, macroTask;
     private EditText relicLimit;
+    private Spinner macroPicker;
+    private MacroEditor macroEditor;
+    private int activeTab = TASK_TAB;
+    private Consumer<Point> pointReceiver;
+    private final OnBackInvokedCallback closeExpandedPreview = () -> setExpanded(false);
 
     private final ServiceConnection connection = new ServiceConnection() {
         @Override public void onServiceConnected(ComponentName name, IBinder binder) {
             session = ISurvivalSession.Stub.asInterface(binder);
             updatePreviewSurface();
             updateControls();
-            updateVibration(null);
+            if (quickPanel.getVisibility() == View.VISIBLE) readFeedback();
             poll();
         }
 
@@ -94,7 +114,7 @@ public final class MainActivity extends Activity {
     @Override protected void onCreate(Bundle savedState) {
         super.onCreate(savedState);
         args = new Shizuku.UserServiceArgs(new ComponentName(this, VirtualGameSession.class))
-                .processNameSuffix("survival_session").daemon(false).version(14);
+                .processNameSuffix("survival_session").daemon(false).version(18);
         if (Build.VERSION.SDK_INT < 35) {
             getWindow().setDecorFitsSystemWindows(false);
             getWindow().setStatusBarColor(Color.TRANSPARENT);
@@ -112,7 +132,7 @@ public final class MainActivity extends Activity {
         visible = true;
         connect(false);
         updatePreviewSurface();
-        updateVibration(null);
+        if (quickPanel.getVisibility() == View.VISIBLE) readFeedback();
         poll();
     }
 
@@ -125,6 +145,7 @@ public final class MainActivity extends Activity {
     }
 
     @Override protected void onDestroy() {
+        if (expanded) getOnBackInvokedDispatcher().unregisterOnBackInvokedCallback(closeExpandedPreview);
         Shizuku.removeBinderReceivedListener(received);
         Shizuku.removeBinderDeadListener(dead);
         Shizuku.removeRequestPermissionResultListener(permission);
@@ -143,11 +164,6 @@ public final class MainActivity extends Activity {
         statusWorker.shutdownNow();
         screenshotWorker.shutdown();
         super.onDestroy();
-    }
-
-    @Override public void onBackPressed() {
-        if (expanded) setExpanded(false);
-        else super.onBackPressed();
     }
 
     @Override public void onWindowFocusChanged(boolean focused) {
@@ -170,13 +186,12 @@ public final class MainActivity extends Activity {
         LinearLayout body = new LinearLayout(this);
         body.setOrientation(LinearLayout.VERTICAL);
         body.setFocusableInTouchMode(true);
-        body.setPadding(dp(20), dp(16), dp(20), dp(20));
+        body.setPadding(dp(16), dp(12), dp(16), dp(16));
         compact.addView(body);
         root.addView(compact);
-        Screen.heading(body, "Warframe 生存");
-
         smallPreview = new FrameLayout(this);
-        smallPreview.setBackgroundColor(Color.rgb(21, 35, 39));
+        smallPreview.setBackground(card(0xff152327, 14));
+        smallPreview.setClipToOutline(true);
         body.addView(smallPreview, new LinearLayout.LayoutParams(-1, dp(200)));
         preview = new TextureView(this);
         preview.setSurfaceTextureListener(new TextureView.SurfaceTextureListener() {
@@ -210,35 +225,7 @@ public final class MainActivity extends Activity {
 
         state = Screen.text(body, "");
         showStatus("正在检查 Shizuku…");
-        authorize = Screen.button(body, "连接 Shizuku", () -> connect(true));
-        LinearLayout gameControls = row(body);
-        launch = rowButton(gameControls, "启动 Warframe", () -> call(ISurvivalSession::launch));
-        close = rowButton(gameControls, "关闭游戏", () -> call(ISurvivalSession::closeGame));
-        screenshot = Screen.button(body, "保存截图", this::saveScreenshot);
-        vibration = Screen.button(body, "读取游戏震动", () ->
-                updateVibration(vibrationMuted == null ? null : !vibrationMuted));
-        relicTask = new CheckBox(this);
-        relicTask.setText("识别核桃");
-        relicTask.setChecked(getPreferences(MODE_PRIVATE).getBoolean("relic_task_enabled", true));
-        body.addView(relicTask);
-        LinearLayout relicSettings = row(body);
-        relicSettings.setGravity(Gravity.CENTER_VERTICAL);
-        relicSettings.setPaddingRelative(dp(24), 0, 0, 0);
-        TextView relicLimitLabel = Screen.text(relicSettings, "开核桃数（0 不限）");
-        relicLimit = new EditText(this);
-        relicLimit.setId(View.generateViewId());
-        relicLimitLabel.setLabelFor(relicLimit.getId());
-        relicLimit.setSingleLine();
-        relicLimit.setInputType(InputType.TYPE_CLASS_NUMBER);
-        relicLimit.setText(String.valueOf(getPreferences(MODE_PRIVATE).getInt("relic_limit", 0)));
-        relicSettings.addView(relicLimit, new LinearLayout.LayoutParams(dp(92), -2));
-        LinearLayout taskControls = row(body);
-        start = rowButton(taskControls, "开始任务", this::startSurvival);
-        stop = rowButton(taskControls, "停止", () -> call(ISurvivalSession::stopSurvival));
-        relicTask.setOnCheckedChangeListener((button, checked) -> {
-            getPreferences(MODE_PRIVATE).edit().putBoolean("relic_task_enabled", checked).apply();
-            updateControls();
-        });
+        buildDashboard(body);
 
         fullPreview = new FrameLayout(this);
         fullPreview.setVisibility(View.GONE);
@@ -255,6 +242,15 @@ public final class MainActivity extends Activity {
         controls.topMargin = dp(8);
         controls.setMarginEnd(dp(8));
         fullPreview.addView(closePreview, controls);
+        pickingHint = new TextView(this);
+        pickingHint.setText("点画面选取坐标");
+        pickingHint.setTextColor(Color.WHITE);
+        pickingHint.setPadding(dp(12), dp(8), dp(12), dp(8));
+        pickingHint.setBackground(card(0xdd152327, 10));
+        pickingHint.setVisibility(View.GONE);
+        FrameLayout.LayoutParams hint = new FrameLayout.LayoutParams(-2, -2, Gravity.TOP | Gravity.CENTER_HORIZONTAL);
+        hint.topMargin = dp(8);
+        fullPreview.addView(pickingHint, hint);
         fullPreview.setOnApplyWindowInsetsListener((view, insets) -> {
             var cutout = insets.getInsets(WindowInsets.Type.displayCutout());
             closePreview.setTranslationX(-cutout.right);
@@ -266,33 +262,230 @@ public final class MainActivity extends Activity {
         updateControls();
     }
 
+    private void buildDashboard(LinearLayout body) {
+        LinearLayout tabBar = row(body);
+        tabBar.setBackground(card(PALE, 12));
+        tabBar.setPadding(dp(4), dp(4), dp(4), dp(4));
+        String[] titles = {"一键挂机", "宏配置", "日志"};
+        for (int i = 0; i < titles.length; i++) {
+            int tab = i;
+            tabs[i] = rowButton(tabBar, titles[i], () -> showTab(tab));
+            tabs[i].setMinHeight(dp(42));
+        }
+        LinearLayout content = column(body);
+        content.setLayoutParams(new LinearLayout.LayoutParams(-1, -2, 1));
+        content.setPadding(0, dp(10), 0, dp(8));
+        for (int i = 0; i < panels.length; i++) panels[i] = column(content);
+
+        LinearLayout taskSplit = row(panels[TASK_TAB]);
+        taskSplit.setMinimumHeight(dp(156));
+        LinearLayout taskList = new LinearLayout(this);
+        taskList.setOrientation(LinearLayout.VERTICAL);
+        taskSplit.addView(taskList, new LinearLayout.LayoutParams(0, -1, 5));
+        LinearLayout settings = new LinearLayout(this);
+        settings.setOrientation(LinearLayout.VERTICAL);
+        settings.setPadding(dp(12), dp(8), dp(12), dp(8));
+        settings.setBackground(card(Color.WHITE, 12));
+        LinearLayout.LayoutParams settingsSize = new LinearLayout.LayoutParams(0, -1, 7);
+        settingsSize.setMarginStart(dp(8));
+        taskSplit.addView(settings, settingsSize);
+        LinearLayout relicRow = row(taskList);
+        LinearLayout macroRow = row(taskList);
+        relicTask = taskCheck(relicRow, "识别核桃", "relic_task_enabled", true);
+        macroTask = taskCheck(macroRow, "技能宏", "macro_task_enabled", false);
+        relicLabel = taskLabel(relicRow, "识别核桃", () -> selectTask(false));
+        macroLabel = taskLabel(macroRow, "技能宏", () -> selectTask(true));
+        relicSettings = column(settings);
+        TextView relicLimitLabel = Screen.text(relicSettings, "开核桃数");
+        relicLimit = new EditText(this);
+        relicLimit.setId(View.generateViewId());
+        relicLimitLabel.setLabelFor(relicLimit.getId());
+        relicLimit.setSingleLine();
+        relicLimit.setInputType(InputType.TYPE_CLASS_NUMBER);
+        relicLimit.setText(String.valueOf(getPreferences(MODE_PRIVATE).getInt("relic_limit", 0)));
+        relicSettings.addView(relicLimit, new LinearLayout.LayoutParams(-1, -2));
+        Screen.text(relicSettings, "0 表示不限");
+        macroSettings = column(settings);
+        Screen.text(macroSettings, "使用的宏");
+        macroPicker = new Spinner(this, Spinner.MODE_DROPDOWN);
+        macroPicker.setContentDescription("使用的宏");
+        macroSettings.addView(macroPicker, new LinearLayout.LayoutParams(-1, dp(42)));
+        Screen.button(macroSettings, "编辑宏", () -> showTab(MACRO_TAB));
+        selectTask(false);
+
+        macroEditor = new MacroEditor(panels[MACRO_TAB], this::pickPoint, this::refreshMacroPicker);
+        refreshMacroPicker(getPreferences(MODE_PRIVATE).getInt("selected_macro", 0));
+        macroPicker.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                if (position == macroPicker.getSelectedItemPosition() && position < macroEditor.macros().size()) {
+                    getPreferences(MODE_PRIVATE).edit().putInt("selected_macro", position).apply();
+                }
+            }
+
+            @Override public void onNothingSelected(AdapterView<?> parent) {}
+        });
+
+        LinearLayout logPanel = panels[LOG_TAB];
+        logPanel.setPadding(dp(12), dp(8), dp(12), dp(12));
+        logPanel.setBackground(card(Color.WHITE, 12));
+        taskLog = Screen.text(logPanel, "暂无任务日志");
+        taskLog.setMinHeight(dp(140));
+        taskLog.setTextIsSelectable(true);
+
+        quickPanel = column(body);
+        quickPanel.setPadding(dp(8), dp(4), dp(8), dp(4));
+        quickPanel.setBackground(card(PALE, 12));
+        quickPanel.setVisibility(View.GONE);
+        authorize = Screen.button(quickPanel, "连接 Shizuku", () -> connect(true));
+        LinearLayout gameControls = row(quickPanel);
+        launch = rowButton(gameControls, "启动游戏", () -> call(ISurvivalSession::launch));
+        close = rowButton(gameControls, "关闭游戏", () -> call(ISurvivalSession::closeGame));
+        LinearLayout feedback = row(quickPanel);
+        vibration = rowButton(feedback, "关闭震动", () -> toggleFeedback(0));
+        audio = rowButton(feedback, "关闭声音", () -> toggleFeedback(1));
+        screenshot = Screen.button(quickPanel, "截图", this::saveScreenshot);
+        footer = row(body);
+        footer.setPadding(0, dp(8), 0, 0);
+        start = rowButton(footer, "开始任务", this::startSurvival);
+        start.setBackgroundTintList(android.content.res.ColorStateList.valueOf(ACCENT));
+        start.setTextColor(Color.WHITE);
+        quickOptions = rowButton(footer, "快捷选项", this::toggleQuickOptions);
+        showTab(TASK_TAB);
+    }
+
+    private CheckBox taskCheck(LinearLayout row, String title, String preference, boolean fallback) {
+        CheckBox box = new CheckBox(this);
+        box.setContentDescription("启用" + title);
+        box.setChecked(getPreferences(MODE_PRIVATE).getBoolean(preference, fallback));
+        row.addView(box, new LinearLayout.LayoutParams(dp(38), dp(48)));
+        box.setOnCheckedChangeListener((button, checked) -> {
+            getPreferences(MODE_PRIVATE).edit().putBoolean(preference, checked).apply();
+            selectTask(button == macroTask);
+            updateControls();
+        });
+        return box;
+    }
+
+    private TextView taskLabel(LinearLayout row, String title, Runnable click) {
+        TextView label = new TextView(this);
+        label.setText(title);
+        label.setTextColor(INK);
+        label.setTextSize(14);
+        label.setGravity(Gravity.CENTER_VERTICAL);
+        label.setPadding(dp(4), 0, dp(4), 0);
+        label.setOnClickListener(view -> click.run());
+        row.addView(label, new LinearLayout.LayoutParams(0, dp(48), 1));
+        return label;
+    }
+
+    private void selectTask(boolean selectMacro) {
+        relicSettings.setVisibility(selectMacro ? View.GONE : View.VISIBLE);
+        macroSettings.setVisibility(selectMacro ? View.VISIBLE : View.GONE);
+        relicLabel.setBackground(selectMacro ? null : card(PALE, 8));
+        macroLabel.setBackground(selectMacro ? card(PALE, 8) : null);
+    }
+
+    private void showTab(int tab) {
+        activeTab = tab;
+        for (int i = 0; i < panels.length; i++) {
+            panels[i].setVisibility(i == tab ? View.VISIBLE : View.GONE);
+            tabs[i].setBackground(card(i == tab ? ACCENT : PALE, 9));
+            tabs[i].setTextColor(i == tab ? Color.WHITE : INK);
+            tabs[i].setSelected(i == tab);
+        }
+        footer.setVisibility(tab == TASK_TAB ? View.VISIBLE : View.GONE);
+        if (tab != TASK_TAB) {
+            quickPanel.setVisibility(View.GONE);
+            quickOptions.setText("快捷选项");
+        }
+        if (tab == LOG_TAB) poll();
+    }
+
+    private void toggleQuickOptions() {
+        boolean show = quickPanel.getVisibility() != View.VISIBLE;
+        quickPanel.setVisibility(show ? View.VISIBLE : View.GONE);
+        quickOptions.setText(show ? "收起选项" : "快捷选项");
+        if (show) {
+            readFeedback();
+            quickOptions.post(() -> compact.smoothScrollTo(0, footer.getBottom()));
+        }
+    }
+
+    private void refreshMacroPicker(int index) {
+        int requested = index >= 0 ? index : macroPicker.getSelectedItemPosition();
+        List<String> names = new ArrayList<>();
+        for (SkillMacro macro : macroEditor.macros()) names.add(macro.name());
+        MacroEditor.setItems(macroPicker, names.isEmpty() ? List.of("暂无已保存的宏") : names);
+        int selected = Math.max(0, Math.min(requested, names.size() - 1));
+        macroPicker.setSelection(selected);
+        getPreferences(MODE_PRIVATE).edit().putInt("selected_macro", selected).apply();
+        if (start != null) updateControls();
+    }
+
+    private GradientDrawable card(int color, int radius) {
+        GradientDrawable background = new GradientDrawable();
+        background.setColor(color);
+        background.setCornerRadius(dp(radius));
+        return background;
+    }
+
     private void startSurvival() {
+        if (phase == VirtualGameSession.RUNNING) {
+            call(ISurvivalSession::stopSurvival);
+            return;
+        }
+        boolean relicEnabled = relicTask.isChecked();
         String text = relicLimit.getText().toString().trim();
         int limit;
         try {
-            limit = text.isEmpty() ? 0 : Integer.parseInt(text);
+            limit = !relicEnabled || text.isEmpty() ? 0 : Integer.parseInt(text);
             if (limit < 0) throw new NumberFormatException();
         } catch (NumberFormatException error) {
+            selectTask(false);
             relicLimit.setError("请输入有效的非负整数");
             return;
         }
-        getPreferences(MODE_PRIVATE).edit().putInt("relic_limit", limit).apply();
-        relicLimit.setText(String.valueOf(limit));
+        if (relicEnabled) {
+            getPreferences(MODE_PRIVATE).edit().putInt("relic_limit", limit).apply();
+            relicLimit.setText(String.valueOf(limit));
+        }
+        String macroJson = "";
+        if (macroTask.isChecked()) {
+            int selected = macroPicker.getSelectedItemPosition();
+            if (selected < 0 || selected >= macroEditor.macros().size()) {
+                Toast.makeText(this, "请先保存一个技能宏", Toast.LENGTH_SHORT).show();
+                showTab(MACRO_TAB);
+                return;
+            }
+            try {
+                macroJson = macroEditor.macros().get(selected).toJson().toString();
+            } catch (org.json.JSONException error) {
+                showStatus("读取宏失败 · " + error.getMessage());
+                return;
+            }
+            getPreferences(MODE_PRIVATE).edit().putInt("selected_macro", selected).apply();
+        }
         relicLimit.clearFocus();
         WindowInsetsController bars = getWindow().getInsetsController();
         if (bars != null) bars.hide(WindowInsets.Type.ime());
-        call(service -> service.startSurvival(limit));
+        String selectedMacro = macroJson;
+        call(service -> service.startSurvival(relicEnabled, limit, selectedMacro));
     }
 
     private void setExpanded(boolean show) {
         if (expanded == show || (show && !hasGameFrame)) return;
+        Consumer<Point> cancelledPick = show ? null : pointReceiver;
+        if (!show) pointReceiver = null;
         endGesture();
         expanded = show;
         if (show) {
+            getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
+                    OnBackInvokedDispatcher.PRIORITY_DEFAULT, closeExpandedPreview);
             smallPreview.removeView(preview);
             preview.setContentDescription("可操作的 Warframe 画面");
             fullPreview.addView(preview, 0, new FrameLayout.LayoutParams(-1, -1));
         } else {
+            getOnBackInvokedDispatcher().unregisterOnBackInvokedCallback(closeExpandedPreview);
             fullPreview.removeView(preview);
             preview.setContentDescription("Warframe 预览，轻触放大");
             smallPreview.addView(preview, new FrameLayout.LayoutParams(-1, -1));
@@ -302,6 +495,18 @@ public final class MainActivity extends Activity {
         applySystemBars();
         setRequestedOrientation(show ? ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
                 : ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
+        pickingHint.setVisibility(show && pointReceiver != null ? View.VISIBLE : View.GONE);
+        if (cancelledPick != null) cancelledPick.accept(null);
+    }
+
+    private boolean pickPoint(Consumer<Point> result) {
+        if (!hasGameFrame) {
+            Toast.makeText(this, "请先启动游戏，或直接填写坐标", Toast.LENGTH_SHORT).show();
+            return false;
+        }
+        pointReceiver = result;
+        setExpanded(true);
+        return true;
     }
 
     private void applySystemBars() {
@@ -326,6 +531,22 @@ public final class MainActivity extends Activity {
 
     private boolean forwardTouch(MotionEvent event) {
         int action = event.getActionMasked();
+        if (pointReceiver != null) {
+            if (action == MotionEvent.ACTION_UP) {
+                Rect bounds = GpuPreview.fit(preview.getWidth(), preview.getHeight(),
+                        VirtualGameSession.WIDTH, VirtualGameSession.HEIGHT);
+                if (bounds.contains((int) event.getX(), (int) event.getY())) {
+                    Point point = new Point((int) ((event.getX() - bounds.left)
+                            * VirtualGameSession.WIDTH / bounds.width()), (int) ((event.getY() - bounds.top)
+                            * VirtualGameSession.HEIGHT / bounds.height()));
+                    Consumer<Point> result = pointReceiver;
+                    pointReceiver = null;
+                    setExpanded(false);
+                    result.accept(point);
+                }
+            }
+            return true;
+        }
         if (action == MotionEvent.ACTION_CANCEL) {
             endGesture();
             return true;
@@ -404,11 +625,13 @@ public final class MainActivity extends Activity {
         if (!visible || active == null || polling) return;
         ui.removeCallbacks(nextPoll);
         polling = true;
+        boolean readLog = activeTab == LOG_TAB;
         statusWorker.execute(() -> {
             try {
                 int currentPhase = active.phase();
                 String message = active.status();
                 boolean frameAvailable = currentPhase != VirtualGameSession.CLOSED && active.hasFrame();
+                String log = readLog ? active.taskLog() : null;
                 ui.post(() -> {
                     if (session != active || !visible) return;
                     phase = currentPhase;
@@ -418,6 +641,10 @@ public final class MainActivity extends Activity {
                     if (hasGameFrame != frameAvailable) {
                         hasGameFrame = frameAvailable;
                         preview.setAlpha(frameAvailable ? 1 : 0);
+                    }
+                    if (log != null) {
+                        String content = log.isEmpty() ? "暂无任务日志" : log;
+                        if (!content.contentEquals(taskLog.getText())) taskLog.setText(content);
                     }
                     updateControls();
                 });
@@ -445,26 +672,37 @@ public final class MainActivity extends Activity {
         return true;
     }
 
-    private void updateVibration(Boolean muted) {
+    private void readFeedback() {
+        updateFeedback(0, null);
+        updateFeedback(1, null);
+    }
+
+    private void toggleFeedback(int type) {
+        Boolean current = feedbackMuted[type];
+        updateFeedback(type, current == null ? null : !current);
+    }
+
+    private void updateFeedback(int type, Boolean muted) {
         ISurvivalSession active = session;
-        if (active == null || vibrationBusy) return;
-        vibrationBusy = true;
+        if (active == null || feedbackBusy[type]) return;
+        feedbackBusy[type] = true;
         updateControls();
         statusWorker.execute(() -> {
             try {
-                boolean result = muted == null ? active.isGameVibrationMuted()
-                        : active.setGameVibrationMuted(muted);
+                boolean result = type == 0
+                        ? (muted == null ? active.isGameVibrationMuted() : active.setGameVibrationMuted(muted))
+                        : (muted == null ? active.isGameAudioMuted() : active.setGameAudioMuted(muted));
                 ui.post(() -> {
                     if (session != active) return;
-                    vibrationBusy = false;
-                    vibrationMuted = result;
+                    feedbackBusy[type] = false;
+                    feedbackMuted[type] = result;
                     updateControls();
                 });
             } catch (RemoteException | RuntimeException error) {
                 ui.post(() -> {
                     if (session != active) return;
-                    vibrationBusy = false;
-                    vibrationMuted = null;
+                    feedbackBusy[type] = false;
+                    feedbackMuted[type] = null;
                     updateControls();
                     Toast.makeText(this, error.getMessage(), Toast.LENGTH_SHORT).show();
                 });
@@ -511,8 +749,10 @@ public final class MainActivity extends Activity {
         session = null;
         bound = false;
         phase = VirtualGameSession.CLOSED;
-        vibrationBusy = false;
-        vibrationMuted = null;
+        for (int i = 0; i < feedbackBusy.length; i++) {
+            feedbackBusy[i] = false;
+            feedbackMuted[i] = null;
+        }
         hasGameFrame = false;
         preview.setAlpha(0);
         showStatus(message);
@@ -522,17 +762,28 @@ public final class MainActivity extends Activity {
     private void updateControls() {
         boolean connected = session != null;
         boolean hasFrame = connected && hasGameFrame;
+        boolean running = phase == VirtualGameSession.RUNNING;
         authorize.setEnabled(!bound);
         launch.setEnabled(connected && phase == VirtualGameSession.CLOSED);
         close.setEnabled(connected && phase != VirtualGameSession.CLOSED);
-        start.setEnabled(connected && phase == VirtualGameSession.READY && relicTask.isChecked());
-        stop.setEnabled(connected && phase == VirtualGameSession.RUNNING);
-        relicTask.setEnabled(phase != VirtualGameSession.RUNNING);
-        relicLimit.setEnabled(phase != VirtualGameSession.RUNNING && relicTask.isChecked());
+        start.setEnabled(connected && (running || phase == VirtualGameSession.READY
+                && (relicTask.isChecked() || macroTask.isChecked())));
+        start.setAlpha(start.isEnabled() ? 1 : 0.55f);
+        start.setText(running ? "停止任务" : "开始任务");
+        relicTask.setEnabled(!running);
+        macroTask.setEnabled(!running);
+        relicLimit.setEnabled(!running);
+        macroPicker.setEnabled(!running && !macroEditor.macros().isEmpty());
         screenshot.setEnabled(hasFrame && !saving);
-        vibration.setEnabled(connected && !vibrationBusy);
-        vibration.setText(vibrationBusy ? "正在更新游戏震动…" : vibrationMuted == null ? "读取游戏震动"
-                : vibrationMuted ? "恢复游戏震动" : "关闭游戏震动");
+        feedbackButton(vibration, 0, "震动", connected);
+        feedbackButton(audio, 1, "声音", connected);
+    }
+
+    private void feedbackButton(Button button, int type, String name, boolean connected) {
+        button.setEnabled(connected && !feedbackBusy[type]);
+        button.setText(feedbackBusy[type] ? "正在更新" + name
+                : feedbackMuted[type] == null ? "读取" + name
+                : (feedbackMuted[type] ? "恢复" : "关闭") + name);
     }
 
     private void call(SessionAction action) {
@@ -550,6 +801,13 @@ public final class MainActivity extends Activity {
         LinearLayout row = new LinearLayout(this);
         body.addView(row);
         return row;
+    }
+
+    private LinearLayout column(LinearLayout parent) {
+        LinearLayout column = new LinearLayout(this);
+        column.setOrientation(LinearLayout.VERTICAL);
+        parent.addView(column, new LinearLayout.LayoutParams(-1, -2));
+        return column;
     }
 
     private Button rowButton(LinearLayout row, String label, Runnable action) {
