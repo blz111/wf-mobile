@@ -12,6 +12,7 @@ final class GameTaskScheduler {
 
     enum State { NORMAL, SELECTING_RELIC }
     enum Decision { WAIT, CHECK_SOON, WAIT_FOR_RELEASE, RETURN_TO_NORMAL, FINISHED }
+    enum TapResult { SENT, MANUAL_TOUCH_ACTIVE, REJECTED }
 
     record Step(Decision decision, String status, int delayMs) {
         Step(Decision decision, String status) {
@@ -22,7 +23,7 @@ final class GameTaskScheduler {
 
     @FunctionalInterface
     interface Tap {
-        boolean whenIdle(Point point) throws Exception;
+        TapResult whenIdle(String operation, Point point) throws Exception;
     }
 
     interface Task {

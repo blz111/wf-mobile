@@ -2,14 +2,18 @@ package dev.wfassistant.mobile;
 
 import android.app.ActivityManager;
 import android.app.ApplicationExitInfo;
+import android.content.AttributionSource;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.ContextWrapper;
 import android.content.Intent;
+import android.content.pm.ActivityInfo;
+import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.Point;
 import android.hardware.display.DisplayManager;
 import android.hardware.display.VirtualDisplay;
+import android.hardware.display.VirtualDisplayConfig;
 import android.os.Build;
 import android.os.ParcelFileDescriptor;
 import android.os.Process;
@@ -24,15 +28,18 @@ import android.view.MotionEvent;
 import android.view.Surface;
 
 import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.ScheduledFuture;
@@ -43,18 +50,17 @@ import java.util.regex.Pattern;
 
 import org.json.JSONObject;
 
+import dev.wfassistant.mobile.GameTaskScheduler.TapResult;
+
 public final class VirtualGameSession extends ISurvivalSession.Stub {
     static final int SHELL_UID = 2000;
     static final int CLOSED = 0, OPENING = 1, READY = 2, RUNNING = 3;
     static final int WIDTH = 1280, HEIGHT = 720;
     private static final int MANUAL_TOUCH_SETTLE_MS = 250;
     private static final int GAME_TASK_WATCH_MS = 1_500;
-    private static final int ALWAYS_UNLOCKED = 1 << 12;
     private static final int DISPLAY_ALWAYS_UNLOCKED = 1 << 9;
     private static final String GAME = "com.digitalextremes.warframemobile";
     private static final DateTimeFormatter LOG_TIME = DateTimeFormatter.ofPattern("HH:mm:ss");
-    private static final ComponentName GOOGLE_CHOOSER = new ComponentName("com.google.android.gms",
-            "com.google.android.gms.auth.api.credentials.assistedsignin.ui.GoogleSignInActivity");
     private static final int DISPLAY_FLAGS = DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC
             | DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
             | (1 << 6)   // SUPPORTS_TOUCH
@@ -74,11 +80,13 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
     private volatile String message = "Shizuku 已连接";
     private volatile int phase = CLOSED;
     private VirtualDisplay display;
+    private VirtualGameDisplay virtualGameDisplay;
     private volatile GpuPreview renderer;
     private Surface previewSurface;
     private int previewWidth, previewHeight;
     private int gameUid;
-    private int googleUid = -1;
+    private Set<ComponentName> loginWindows = Set.of();
+    private final Map<String, Integer> loginWindowUids = new LinkedHashMap<>();
     private int gestureUid;
     private String gameUser;
     private int trackedTaskId = -1;
@@ -100,8 +108,12 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
     public VirtualGameSession(Context context) {
         if (Process.myUid() != SHELL_UID) throw new SecurityException("需要 ADB shell 身份");
         shellContext = new ContextWrapper(context) {
-            @Override public String getPackageName() { return "com.android.shell"; }
-            @Override public String getOpPackageName() { return "com.android.shell"; }
+            @Override public Context getApplicationContext() { return this; }
+            @Override public String getPackageName() { return VirtualGameDisplay.SHELL_PACKAGE; }
+            @Override public String getOpPackageName() { return VirtualGameDisplay.SHELL_PACKAGE; }
+            @Override public AttributionSource getAttributionSource() {
+                return new AttributionSource.Builder(SHELL_UID).setPackageName(getPackageName()).build();
+            }
         };
         worker.setRemoveOnCancelPolicy(true);
         displayPowerWorker.setRemoveOnCancelPolicy(true);
@@ -190,13 +202,13 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
             message = "正在启动 Warframe…";
             try {
                 gameUser = currentUser();
-                googleUid = -1;
+                loginWindowUids.clear();
                 String component = findLine(command("/system/bin/cmd", "package", "resolve-activity",
                         "--brief", "--user", gameUser, "-a", "android.intent.action.MAIN",
                         "-c", "android.intent.category.LAUNCHER", GAME),
                         GAME + "/", "当前用户未安装 Warframe");
                 gameUid = packageUid(GAME);
-                createDisplay();
+                createDisplay(ComponentName.unflattenFromString(component));
                 int id = display.getDisplay().getDisplayId();
                 gameStartedAt = System.currentTimeMillis();
                 String result = command("/system/bin/am", "start", "--display", String.valueOf(id),
@@ -212,22 +224,33 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
         });
     }
 
-    private void createDisplay() throws Exception {
-        renderer = new GpuPreview(WIDTH, HEIGHT);
-        DisplayManager manager = DisplayManager.class.getConstructor(Context.class).newInstance(shellContext);
-        try {
-            display = manager.createVirtualDisplay("Warframe Assistant", WIDTH, HEIGHT, 280,
-                    renderer.inputSurface(), DISPLAY_FLAGS | ALWAYS_UNLOCKED);
-        } catch (SecurityException error) {
-            Log.w("WarframePower", "Always-unlocked display permission unavailable", error);
-            display = manager.createVirtualDisplay("Warframe Assistant", WIDTH, HEIGHT, 280,
-                    renderer.inputSurface(), DISPLAY_FLAGS);
-            logEvent("系统未授予虚拟屏始终解锁权限，已使用普通虚拟屏");
+    private void createDisplay(ComponentName launcher) throws Exception {
+        if (launcher == null) throw new IOException("无法解析 Warframe 启动窗口");
+        Set<ComponentName> allowed = new HashSet<>();
+        allowed.add(launcher);
+        allowed.add(new ComponentName(GAME, GAME + ".MainActivity"));
+        PackageManager packages = shellContext.getPackageManager();
+        loginWindows = LoginWindows.resolve(packages);
+        allowed.addAll(loginWindows);
+        ActivityInfo[] activities = packages
+                .getPackageInfo(GAME, PackageManager.PackageInfoFlags.of(PackageManager.GET_ACTIVITIES)).activities;
+        if (activities != null) {
+            for (ActivityInfo activity : activities) allowed.add(new ComponentName(GAME, activity.name));
         }
-        if (display == null || display.getDisplay().getDisplayId() == Display.DEFAULT_DISPLAY
+
+        renderer = new GpuPreview(WIDTH, HEIGHT);
+        VirtualDisplayConfig config = new VirtualDisplayConfig.Builder("Warframe Assistant", WIDTH, HEIGHT, 280)
+                .setFlags(DISPLAY_FLAGS).setSurface(renderer.inputSurface()).build();
+        virtualGameDisplay = VirtualGameDisplay.open(shellContext, config, allowed);
+        display = virtualGameDisplay.display();
+        if (display.getDisplay().getDisplayId() == Display.DEFAULT_DISPLAY
                 || (display.getDisplay().getFlags() & NON_STEALING_FOCUS) != NON_STEALING_FOCUS) {
             throw new IOException("系统未创建具备独立焦点的虚拟屏");
         }
+        if ((display.getDisplay().getFlags() & DISPLAY_ALWAYS_UNLOCKED) == 0) {
+            logEvent("系统未授予虚拟屏始终解锁权限，已使用普通锁屏策略");
+        }
+        logEvent("虚拟屏已启用窗口白名单");
         attachPreview();
         startDisplayKeepAlive(display.getDisplay());
     }
@@ -624,11 +647,16 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
             throw new IOException("虚拟屏不可用");
         }
         ComponentName activity = previewActivity(findGameTask(id, false));
-        if (GOOGLE_CHOOSER.equals(activity)) {
-            if (googleUid < 0) googleUid = packageUid(GOOGLE_CHOOSER.getPackageName());
-            return googleUid;
+        if (activity != null) {
+            String packageName = activity.getPackageName();
+            if (GAME.equals(packageName)) return gameUid;
+            Integer uid = loginWindowUids.get(packageName);
+            if (uid == null) {
+                uid = packageUid(packageName);
+                loginWindowUids.put(packageName, uid);
+            }
+            return uid;
         }
-        if (activity != null && GAME.equals(activity.getPackageName())) return gameUid;
         throw new IOException("当前窗口无法转发触摸");
     }
 
@@ -639,10 +667,10 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
         return Integer.parseInt(uid.substring(prefix.length()));
     }
 
-    private static ComponentName previewActivity(Object task) throws ReflectiveOperationException {
+    private ComponentName previewActivity(Object task) throws ReflectiveOperationException {
         if (task == null || !task.getClass().getField("visible").getBoolean(task)) return null;
         ComponentName top = (ComponentName) task.getClass().getField("topActivity").get(task);
-        return top != null && (GAME.equals(top.getPackageName()) || GOOGLE_CHOOSER.equals(top)) ? top : null;
+        return top != null && (GAME.equals(top.getPackageName()) || loginWindows.contains(top)) ? top : null;
     }
 
     private boolean manualTouchActive() {
@@ -650,17 +678,43 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
                 || SystemClock.uptimeMillis() - lastManualTouch < MANUAL_TOUCH_SETTLE_MS;
     }
 
-    private boolean tapWhenIdle(Point point) throws Exception {
-        if (manualTouchActive()) return false;
+    private TapResult tapWhenIdle(String operation, Point point) throws Exception {
+        if (manualTouchActive()) return TapResult.MANUAL_TOUCH_ACTIVE;
         try {
             sendPoint(MotionEvent.ACTION_DOWN, point);
             SystemClock.sleep(45);
             sendPoint(MotionEvent.ACTION_UP, point);
-            return true;
+            return TapResult.SENT;
+        } catch (InputRejectedException error) {
+            cancelTouches();
+            String detail = operation + " · 坐标 (" + point.x + ", " + point.y + ") · "
+                    + error.getMessage() + " · " + touchWindowDetails() + " · 继续识别游戏画面";
+            Log.w("WarframeInput", detail, error);
+            logEvent(detail);
+            return TapResult.REJECTED;
         } catch (Exception error) {
             cancelTouches();
             throw error;
         }
+    }
+
+    private String touchWindowDetails() {
+        Display target = display.getDisplay();
+        String window;
+        try {
+            Object task = findGameTask(target.getDisplayId(), false);
+            if (task == null) {
+                window = "未找到游戏任务";
+            } else {
+                Class<?> type = task.getClass();
+                ComponentName top = (ComponentName) type.getField("topActivity").get(task);
+                window = "游戏任务顶部 " + (top == null ? "未知" : top.flattenToShortString())
+                        + " · 任务可见 " + type.getField("visible").getBoolean(task);
+            }
+        } catch (Exception error) {
+            window = "读取游戏窗口失败 " + error.getClass().getSimpleName();
+        }
+        return window + " · 显示状态 " + target.getState();
     }
 
     private void sendPoint(int action, Point point) throws Exception {
@@ -765,11 +819,34 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
             setDisplayId = InputEvent.class.getMethod("setDisplayId", int.class);
             inputManager = type.getMethod("getInstance").invoke(null);
         }
-        setDisplayId.invoke(event, display.getDisplay().getDisplayId());
-        if (!Boolean.TRUE.equals(injectEvent.invoke(inputManager, event, 1, targetUid))) {
-            String input = event instanceof KeyEvent ? "手柄按键"
-                    : event.isFromSource(InputDevice.SOURCE_JOYSTICK) ? "手柄摇杆事件" : "触摸事件";
-            throw new IOException("Android 拒绝了" + input);
+        int displayId = display.getDisplay().getDisplayId();
+        setDisplayId.invoke(event, displayId);
+        try {
+            if (!Boolean.TRUE.equals(injectEvent.invoke(inputManager, event, 1, targetUid))) {
+                throw new InputRejectedException(event, displayId, targetUid, null);
+            }
+        } catch (InvocationTargetException error) {
+            if (error.getCause() instanceof SecurityException denied) {
+                throw new InputRejectedException(event, displayId, targetUid, denied);
+            }
+            throw error;
+        }
+    }
+
+    private static final class InputRejectedException extends IOException {
+        InputRejectedException(InputEvent event, int displayId, int targetUid, SecurityException denied) {
+            super("Android 拒绝了" + describe(event) + " · 虚拟屏 " + displayId + " · 目标 UID " + targetUid
+                    + " · " + (denied == null ? "输入接口返回 false，系统未提供具体原因" : denied), denied);
+        }
+
+        private static String describe(InputEvent event) {
+            if (event instanceof KeyEvent key) {
+                return "手柄按键 " + (key.getAction() == KeyEvent.ACTION_DOWN ? "DOWN " : "UP ")
+                        + KeyEvent.keyCodeToString(key.getKeyCode());
+            }
+            MotionEvent motion = (MotionEvent) event;
+            String source = motion.isFromSource(InputDevice.SOURCE_JOYSTICK) ? "摇杆事件" : "触摸事件";
+            return source + " " + MotionEvent.actionToString(motion.getAction());
         }
     }
 
@@ -843,8 +920,10 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
         clearTasks();
         cancelTouches();
         phase = CLOSED;
-        if (display != null) display.release();
+        if (virtualGameDisplay != null) virtualGameDisplay.close();
+        virtualGameDisplay = null;
         display = null;
+        loginWindows = Set.of();
         GpuPreview active = renderer;
         renderer = null;
         if (active != null) active.close();
@@ -855,7 +934,7 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
                 .orElseThrow(() -> new IOException(error));
     }
 
-    private static String command(String... args) throws Exception {
+    static String command(String... args) throws Exception {
         java.lang.Process process = new ProcessBuilder(args).redirectErrorStream(true).start();
         FutureTask<byte[]> read = new FutureTask<>(() -> {
             try (var stream = process.getInputStream()) {
@@ -875,9 +954,13 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
 
     private void report(Exception error) {
         Throwable cause = error;
-        while (cause.getCause() != null && cause.getCause() != cause) cause = cause.getCause();
+        while ((cause instanceof java.lang.reflect.InvocationTargetException || cause instanceof ExecutionException)
+                && cause.getCause() != null) {
+            cause = cause.getCause();
+        }
         String detail = cause.getMessage();
         message = "操作失败 · " + (detail == null || detail.isBlank() ? cause.getClass().getSimpleName() : detail);
+        Log.w("WarframeSurvival", message, error);
         logEvent(message);
     }
 }
