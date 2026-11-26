@@ -1,5 +1,7 @@
 package dev.wfassistant.mobile;
 
+import android.app.ActivityManager;
+import android.app.ApplicationExitInfo;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.ContextWrapper;
@@ -28,7 +30,10 @@ import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
@@ -62,6 +67,8 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
 
     private final Context shellContext;
     private final ScheduledThreadPoolExecutor worker = new ScheduledThreadPoolExecutor(1);
+    private final ScheduledThreadPoolExecutor displayPowerWorker = new ScheduledThreadPoolExecutor(1, task ->
+            new Thread(task, "wf-display-power"));
     private final AtomicInteger queuedManualTouches = new AtomicInteger();
     private final ArrayDeque<String> log = new ArrayDeque<>();
     private volatile String message = "Shizuku 已连接";
@@ -77,6 +84,7 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
     private int trackedTaskId = -1;
     private int recentsHandledTaskId = -1;
     private long lastTaskMove;
+    private long gameStartedAt;
     private ScheduledFuture<?> pending;
     private ScheduledFuture<?> powerKeepAlive;
     private ScheduledFuture<?> gameTaskWatch;
@@ -96,6 +104,7 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
             @Override public String getOpPackageName() { return "com.android.shell"; }
         };
         worker.setRemoveOnCancelPolicy(true);
+        displayPowerWorker.setRemoveOnCancelPolicy(true);
     }
 
     @Override public String status() { return message; }
@@ -189,6 +198,7 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
                 gameUid = packageUid(GAME);
                 createDisplay();
                 int id = display.getDisplay().getDisplayId();
+                gameStartedAt = System.currentTimeMillis();
                 String result = command("/system/bin/am", "start", "--display", String.valueOf(id),
                         "--user", gameUser, "-f", String.valueOf(Intent.FLAG_ACTIVITY_NEW_TASK
                                 | Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS), "-a", "android.intent.action.MAIN", "-c",
@@ -212,6 +222,7 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
             Log.w("WarframePower", "Always-unlocked display permission unavailable", error);
             display = manager.createVirtualDisplay("Warframe Assistant", WIDTH, HEIGHT, 280,
                     renderer.inputSurface(), DISPLAY_FLAGS);
+            logEvent("系统未授予虚拟屏始终解锁权限，已使用普通虚拟屏");
         }
         if (display == null || display.getDisplay().getDisplayId() == Display.DEFAULT_DISPLAY
                 || (display.getDisplay().getFlags() & NON_STEALING_FOCUS) != NON_STEALING_FOCUS) {
@@ -227,15 +238,27 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
             VirtualDisplayPower power = new VirtualDisplayPower(id);
             Log.i("WarframePower", "Display " + id + " keep-alive enabled, alwaysUnlocked="
                     + ((target.getFlags() & DISPLAY_ALWAYS_UNLOCKED) != 0));
-            powerKeepAlive = worker.scheduleWithFixedDelay(() -> {
-                try {
-                    if (target.isValid()) power.keepAwake();
-                } catch (ReflectiveOperationException error) {
-                    Log.w("WarframePower", "Could not keep virtual display awake", error);
+            powerKeepAlive = displayPowerWorker.scheduleWithFixedDelay(new Runnable() {
+                private boolean failed;
+
+                @Override public void run() {
+                    try {
+                        if (!target.isValid()) return;
+                        power.keepAwake();
+                        if (failed) logEvent("虚拟屏保活已恢复");
+                        failed = false;
+                    } catch (ReflectiveOperationException | RuntimeException error) {
+                        if (!failed && target.isValid()) {
+                            Log.w("WarframePower", "Could not keep virtual display awake", error);
+                            logEvent("虚拟屏保活失败 · " + (error.getCause() == null ? error : error.getCause()));
+                        }
+                        failed = true;
+                    }
                 }
             }, 0, 4, TimeUnit.SECONDS);
         } catch (ReflectiveOperationException | RuntimeException error) {
             Log.w("WarframePower", "Display keep-alive unavailable", error);
+            logEvent("无法启用虚拟屏保活 · " + error.getMessage());
         }
     }
 
@@ -398,12 +421,12 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
         });
     }
 
-    @Override public void startSurvival(boolean relicEnabled, int limit, String macroJson) {
-        worker.execute(() -> {
-            if (phase != READY) return;
+    @Override public boolean startSurvival(boolean relicEnabled, int limit, String macroJson) {
+        FutureTask<Boolean> request = new FutureTask<>(() -> {
+            if (phase != READY) return false;
             if (limit < 0) {
                 message = "开核桃数需要是非负整数";
-                return;
+                return false;
             }
             try {
                 List<GameTaskScheduler.Task> tasks = new ArrayList<>();
@@ -412,21 +435,35 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
                     SkillMacro macro = SkillMacro.fromJson(new JSONObject(macroJson));
                     tasks.add(new MacroTask(macro, worker, new MacroInput(), this::logEvent, this::failTasks));
                 }
-                if (tasks.isEmpty()) return;
+                if (tasks.isEmpty()) return false;
                 taskScheduler = new GameTaskScheduler(tasks);
                 phase = RUNNING;
                 List<String> progress = new ArrayList<>();
                 for (GameTaskScheduler.Task task : tasks) progress.add(task.progress());
                 logEvent("开始任务 · " + String.join(" · ", progress));
-                scan();
+                pending = worker.schedule(this::scan, 0, TimeUnit.MILLISECONDS);
+                return true;
             } catch (Exception error) {
                 failTasks(error);
+                return false;
             }
         });
+        worker.execute(request);
+        try {
+            return request.get();
+        } catch (InterruptedException error) {
+            request.cancel(false);
+            Thread.currentThread().interrupt();
+            return false;
+        } catch (ExecutionException error) {
+            Log.e("WarframeSurvival", "Could not start task", error);
+            return false;
+        }
     }
 
     private final class MacroInput implements MacroTask.Input {
-        private long downTime;
+        private final Map<Integer, Long> keysDown = new LinkedHashMap<>();
+        private SkillMacro.Direction left, right;
 
         @Override public boolean isIdle() { return !manualTouchActive(); }
 
@@ -434,24 +471,64 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
             if (phase != RUNNING || !isIdle()) return false;
             checkTarget();
             switch (action.kind()) {
-                case GAMEPAD -> {
-                    downTime = SystemClock.uptimeMillis();
-                    sendGamepad(KeyEvent.ACTION_DOWN, action.key(), downTime);
+                case GAMEPAD, GAMEPAD_DOWN -> {
+                    if (!keysDown.containsKey(action.key())) {
+                        long downTime = SystemClock.uptimeMillis();
+                        sendGamepad(KeyEvent.ACTION_DOWN, action.key(), downTime);
+                        keysDown.put(action.key(), downTime);
+                    }
                 }
-                case JOYSTICK -> sendJoystick(action.stick(), action.direction().x, action.direction().y);
+                case JOYSTICK, JOYSTICK_MOVE -> moveStick(action.stick(), action.direction());
                 case TAP, HOLD -> sendPoint(MotionEvent.ACTION_DOWN, new Point(action.x(), action.y()));
-                case WAIT -> throw new IllegalArgumentException("等待动作无需发送输入");
+                default -> throw new IllegalArgumentException("此动作无需按下");
             }
             return true;
         }
 
         @Override public void release(SkillMacro.Action action) throws Exception {
             switch (action.kind()) {
-                case GAMEPAD -> sendGamepad(KeyEvent.ACTION_UP, action.key(), downTime);
-                case JOYSTICK -> sendJoystick(action.stick(), 0, 0);
+                case GAMEPAD, GAMEPAD_UP -> releaseKey(action.key());
+                case JOYSTICK, JOYSTICK_CENTER -> moveStick(action.stick(), null);
                 case TAP, HOLD -> sendPoint(MotionEvent.ACTION_UP, new Point(action.x(), action.y()));
-                case WAIT -> throw new IllegalArgumentException("等待动作无需发送输入");
+                default -> throw new IllegalArgumentException("此动作无需松开");
             }
+        }
+
+        private void releaseKey(int key) throws Exception {
+            Long downTime = keysDown.get(key);
+            if (downTime == null) return;
+            sendGamepad(KeyEvent.ACTION_UP, key, downTime);
+            keysDown.remove(key);
+        }
+
+        private void moveStick(SkillMacro.Stick stick, SkillMacro.Direction direction) throws Exception {
+            SkillMacro.Direction nextLeft = stick == SkillMacro.Stick.LEFT ? direction : left;
+            SkillMacro.Direction nextRight = stick == SkillMacro.Stick.RIGHT ? direction : right;
+            if (nextLeft == left && nextRight == right) return;
+            sendJoystick(nextLeft, nextRight);
+            left = nextLeft;
+            right = nextRight;
+        }
+
+        @Override public void resetController() throws Exception {
+            if (keysDown.isEmpty() && left == null && right == null) return;
+            IOException failure = new IOException("释放手柄输入失败");
+            for (int key : List.copyOf(keysDown.keySet())) {
+                try {
+                    releaseKey(key);
+                } catch (Exception error) {
+                    failure.addSuppressed(error);
+                }
+            }
+            if (left != null || right != null) {
+                try {
+                    sendJoystick(null, null);
+                    left = right = null;
+                } catch (Exception error) {
+                    failure.addSuppressed(error);
+                }
+            }
+            if (failure.getSuppressed().length > 0) throw failure;
         }
     }
 
@@ -498,8 +575,8 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
         cancelPending();
         clearTasks();
         cancelTouches();
-        if (phase == RUNNING) phase = READY;
         report(error);
+        if (phase == RUNNING) phase = READY;
     }
 
     private void checkTarget() throws Exception {
@@ -507,14 +584,37 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
         Point size = new Point();
         target.getRealSize(size);
         int id = target.getDisplayId();
-        if (id == Display.DEFAULT_DISPLAY || target.getState() != Display.STATE_ON
-                || size.x != WIDTH || size.y != HEIGHT) {
-            throw new IOException("Warframe 不在可操作的虚拟屏，或虚拟屏尺寸已变化");
+        if (id == Display.DEFAULT_DISPLAY || !target.isValid()) {
+            throw new IOException("游戏虚拟屏已失效");
+        }
+        int displayState = target.getState();
+        if (displayState != Display.STATE_ON) {
+            throw new IOException("游戏虚拟屏未亮起 · 显示状态 " + displayState);
+        }
+        if (size.x != WIDTH || size.y != HEIGHT) {
+            throw new IOException("游戏虚拟屏尺寸已变化 · " + size.x + "×" + size.y);
         }
         ComponentName activity = previewActivity(findGameTask(id, false));
+        if (activity == null && phase == RUNNING) {
+            throw new IOException("游戏画面已退出" + recentGameExit());
+        }
         if (activity == null || !GAME.equals(activity.getPackageName())) {
             throw new IOException("请先进入 Warframe 游戏画面");
         }
+    }
+
+    private String recentGameExit() {
+        try {
+            ActivityManager manager = shellContext.getSystemService(ActivityManager.class);
+            for (ApplicationExitInfo exit : manager.getHistoricalProcessExitReasons(GAME, 0, 4)) {
+                if (exit.getTimestamp() >= gameStartedAt && GAME.equals(exit.getProcessName())) {
+                    return " · Android 记录：" + TaskHistory.describeExit(exit.getReason());
+                }
+            }
+        } catch (RuntimeException error) {
+            Log.w("WarframeSurvival", "Could not read Warframe exit history", error);
+        }
+        return "";
     }
 
     private int manualTargetUid() throws Exception {
@@ -638,18 +738,15 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
         injectToGame(event, gameUid);
     }
 
-    private void sendJoystick(SkillMacro.Stick stick, float x, float y) throws Exception {
+    private void sendJoystick(SkillMacro.Direction left, SkillMacro.Direction right) throws Exception {
         MotionEvent.PointerProperties pointer = new MotionEvent.PointerProperties();
         pointer.id = 0;
         pointer.toolType = MotionEvent.TOOL_TYPE_UNKNOWN;
         MotionEvent.PointerCoords axes = new MotionEvent.PointerCoords();
-        if (stick == SkillMacro.Stick.LEFT) {
-            axes.setAxisValue(MotionEvent.AXIS_X, x);
-            axes.setAxisValue(MotionEvent.AXIS_Y, y);
-        } else {
-            axes.setAxisValue(MotionEvent.AXIS_Z, x);
-            axes.setAxisValue(MotionEvent.AXIS_RZ, y);
-        }
+        axes.setAxisValue(MotionEvent.AXIS_X, left == null ? 0 : left.x);
+        axes.setAxisValue(MotionEvent.AXIS_Y, left == null ? 0 : left.y);
+        axes.setAxisValue(MotionEvent.AXIS_Z, right == null ? 0 : right.x);
+        axes.setAxisValue(MotionEvent.AXIS_RZ, right == null ? 0 : right.y);
         long now = SystemClock.uptimeMillis();
         MotionEvent event = MotionEvent.obtain(now, now, MotionEvent.ACTION_MOVE, 1,
                 new MotionEvent.PointerProperties[]{pointer}, new MotionEvent.PointerCoords[]{axes},
@@ -711,6 +808,7 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
             try {
                 release();
             } finally {
+                displayPowerWorker.shutdownNow();
                 if (previewSurface != null) previewSurface.release();
                 System.exit(0);
             }

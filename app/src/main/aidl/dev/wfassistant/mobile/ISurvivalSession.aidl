@@ -10,7 +10,7 @@ interface ISurvivalSession {
     int phase() = 3;
     void touch(int action, in int[] ids, in float[] xs, in float[] ys) = 4;
     void closeGame() = 5;
-    void startSurvival(boolean relicEnabled, int relicLimit, String macroJson) = 6;
+    boolean startSurvival(boolean relicEnabled, int relicLimit, String macroJson) = 6;
     void stopSurvival() = 7;
     boolean saveScreenshot(in ParcelFileDescriptor output) = 8;
     void setPreviewSurface(in Surface surface, int width, int height) = 9;

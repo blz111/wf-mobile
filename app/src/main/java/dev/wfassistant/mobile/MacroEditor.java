@@ -121,7 +121,9 @@ final class MacroEditor {
     List<SkillMacro> macros() { return macros; }
 
     private void selectAction() {
-        SkillMacro.Kind[] kinds = SkillMacro.Kind.values();
+        SkillMacro.Kind[] kinds = {SkillMacro.Kind.TAP, SkillMacro.Kind.HOLD, SkillMacro.Kind.WAIT,
+                SkillMacro.Kind.GAMEPAD_DOWN, SkillMacro.Kind.GAMEPAD_UP,
+                SkillMacro.Kind.JOYSTICK_MOVE, SkillMacro.Kind.JOYSTICK_CENTER};
         String[] labels = new String[kinds.length];
         for (int i = 0; i < kinds.length; i++) labels[i] = kinds[i].label;
         new AlertDialog.Builder(context).setTitle("添加动作")
@@ -246,20 +248,21 @@ final class MacroEditor {
             x.setHint("0–1279");
             y.setHint("0–719");
         }
-        Spinner keys = kind == SkillMacro.Kind.GAMEPAD ? choice(form, "按键", List.of(SkillMacro.GAMEPAD_LABELS),
+        Spinner keys = kind.isKey() ? choice(form, "按键", List.of(SkillMacro.GAMEPAD_LABELS),
                 action == null ? 0 : SkillMacro.keyIndex(action.key())) : null;
-        boolean joystick = kind == SkillMacro.Kind.JOYSTICK;
+        boolean joystick = kind.isStick();
         LinearLayout axes = joystick ? row(form, 6) : null;
         Spinner stick = joystick ? choice(fieldColumn(axes, 0), "摇杆", List.of(SkillMacro.Stick.values()),
                 action == null ? 0 : action.stick().ordinal()) : null;
-        Spinner direction = joystick ? choice(fieldColumn(axes, 10), "方向", List.of(SkillMacro.Direction.values()),
+        Spinner direction = joystick && !kind.isRelease() ? choice(fieldColumn(axes, 10), "方向", List.of(SkillMacro.Direction.values()),
                 action == null ? 0 : action.direction().ordinal()) : null;
         int defaultTime = switch (kind) {
             case TAP -> 45;
             case GAMEPAD -> 100;
             case WAIT, HOLD, JOYSTICK -> 500;
+            case GAMEPAD_DOWN, GAMEPAD_UP, JOYSTICK_MOVE, JOYSTICK_CENTER -> 0;
         };
-        EditText duration = kind == SkillMacro.Kind.TAP ? null : field(form,
+        EditText duration = kind == SkillMacro.Kind.TAP || kind.isInstant() ? null : field(form,
                 kind == SkillMacro.Kind.WAIT ? "等待时间（毫秒）" : joystick ? "推住时间（毫秒）" : "按住时间（毫秒）",
                 String.valueOf(action == null ? defaultTime : action.milliseconds()));
         AlertDialog dialog = new AlertDialog.Builder(context).setTitle(kind.label).setView(form)
@@ -275,10 +278,11 @@ final class MacroEditor {
         }), spaced(-1, dp(48), 10));
         dialog.setOnShowListener(ignored -> dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
             try {
-                int milliseconds = duration == null ? defaultTime : number(duration);
+                int milliseconds = duration == null
+                        ? (action == null ? defaultTime : action.milliseconds()) : number(duration);
                 SkillMacro.Action updated = joystick
-                        ? SkillMacro.Action.joystick((SkillMacro.Stick) stick.getSelectedItem(),
-                                (SkillMacro.Direction) direction.getSelectedItem(), milliseconds)
+                        ? new SkillMacro.Action(kind, 0, 0, 0, milliseconds, (SkillMacro.Stick) stick.getSelectedItem(),
+                                direction == null ? null : (SkillMacro.Direction) direction.getSelectedItem())
                         : new SkillMacro.Action(kind, x == null ? 0 : number(x), y == null ? 0 : number(y),
                                 keys == null ? 0 : SkillMacro.GAMEPAD_KEYS[keys.getSelectedItemPosition()], milliseconds);
                 if (index < 0) draft.add(updated);

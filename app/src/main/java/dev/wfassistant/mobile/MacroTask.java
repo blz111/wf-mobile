@@ -19,6 +19,7 @@ final class MacroTask implements GameTaskScheduler.Task {
         boolean isIdle();
         boolean press(SkillMacro.Action action) throws Exception;
         void release(SkillMacro.Action action) throws Exception;
+        void resetController() throws Exception;
     }
 
     private final SkillMacro macro;
@@ -26,6 +27,7 @@ final class MacroTask implements GameTaskScheduler.Task {
     private final Input input;
     private final Consumer<String> log;
     private final Consumer<Exception> onFailure;
+    private final boolean hasDelay;
     private final Set<Integer> sentKeys = new HashSet<>();
     private ScheduledFuture<?> pending;
     private SkillMacro.Action pressed;
@@ -40,6 +42,7 @@ final class MacroTask implements GameTaskScheduler.Task {
         this.input = input;
         this.log = log;
         this.onFailure = onFailure;
+        hasDelay = macro.actions().stream().anyMatch(action -> action.milliseconds() > 0);
     }
 
     @Override public State state() { return State.NORMAL; }
@@ -63,23 +66,34 @@ final class MacroTask implements GameTaskScheduler.Task {
         if (!running) return;
         try {
             releasePressed();
+            if (!input.isIdle()) {
+                pause();
+                return;
+            }
+            if (actionIndex == macro.actions().size()) {
+                input.resetController();
+                actionIndex = 0;
+            }
             SkillMacro.Action action = macro.actions().get(actionIndex);
-            if (action.kind() != SkillMacro.Kind.WAIT) {
+            if (action.kind().isRelease()) {
+                input.release(action);
+            } else if (action.kind() != SkillMacro.Kind.WAIT) {
                 if (!input.press(action)) {
                     pause();
                     return;
                 }
-                pressed = action;
-                if (action.kind() == SkillMacro.Kind.GAMEPAD && sentKeys.add(action.key())) {
+                if (!action.kind().isInstant()) pressed = action;
+                if (action.kind().isKey() && sentKeys.add(action.key())) {
                     log.accept("已提交手柄按键 · " + action.describe());
                 }
-                if (action.kind() == SkillMacro.Kind.JOYSTICK && !loggedJoystick) {
+                if (action.kind().isStick() && !loggedJoystick) {
                     log.accept("已提交手柄摇杆 · " + action.describe());
                     loggedJoystick = true;
                 }
             }
-            actionIndex = (actionIndex + 1) % macro.actions().size();
-            pending = worker.schedule(this::advance, action.milliseconds(), TimeUnit.MILLISECONDS);
+            actionIndex++;
+            int delay = !hasDelay && actionIndex == macro.actions().size() ? 16 : action.milliseconds();
+            pending = worker.schedule(this::advance, delay, TimeUnit.MILLISECONDS);
         } catch (Exception error) {
             onFailure.accept(error);
         }
@@ -91,7 +105,17 @@ final class MacroTask implements GameTaskScheduler.Task {
         actionIndex = 0;
         if (running) log.accept("暂停技能宏 · " + macro.name());
         running = false;
-        releasePressed();
+        try {
+            releasePressed();
+        } catch (Exception error) {
+            try {
+                input.resetController();
+            } catch (Exception resetError) {
+                error.addSuppressed(resetError);
+            }
+            throw error;
+        }
+        input.resetController();
     }
 
     private void releasePressed() throws Exception {

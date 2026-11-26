@@ -1,9 +1,9 @@
 package dev.wfassistant.mobile;
 
+import android.Manifest;
 import android.app.Activity;
-import android.content.ComponentName;
 import android.content.ContentValues;
-import android.content.ServiceConnection;
+import android.content.Intent;
 import android.content.pm.ActivityInfo;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
@@ -15,11 +15,12 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
-import android.os.IBinder;
 import android.os.Looper;
 import android.os.ParcelFileDescriptor;
+import android.os.PowerManager;
 import android.os.RemoteException;
 import android.provider.MediaStore;
+import android.provider.Settings;
 import android.text.InputType;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -54,18 +55,17 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.function.Consumer;
 
-import rikka.shizuku.Shizuku;
-
 public final class MainActivity extends Activity {
-    private static final int REQUEST_SHIZUKU = 1;
+    private static final int REQUEST_NOTIFICATIONS = 1;
     private static final int TASK_TAB = 0, MACRO_TAB = 1, LOG_TAB = 2;
     private static final int INK = 0xff18312c, ACCENT = 0xff216958, PALE = 0xffe1eee8;
     private final Handler ui = new Handler(Looper.getMainLooper());
     private final ExecutorService statusWorker = Executors.newSingleThreadExecutor();
     private final ExecutorService screenshotWorker = Executors.newSingleThreadExecutor();
-    private Shizuku.UserServiceArgs args;
+    private GameConnection gameConnection;
+    private TaskHistory taskHistory;
     private ISurvivalSession session;
-    private boolean bound, visible, polling, expanded, touching, saving, hasGameFrame;
+    private boolean visible, polling, expanded, touching, saving, hasGameFrame;
     private final boolean[] feedbackBusy = new boolean[2];
     private final Boolean[] feedbackMuted = new Boolean[2];
     private int phase = VirtualGameSession.CLOSED;
@@ -76,6 +76,7 @@ public final class MainActivity extends Activity {
     private Surface previewSurface;
     private int previewWidth, previewHeight;
     private Button authorize, launch, close, start, screenshot, vibration, audio, quickOptions;
+    private Button battery, notifications;
     private final Button[] tabs = new Button[3];
     private final LinearLayout[] panels = new LinearLayout[3];
     private LinearLayout relicSettings, macroSettings, quickPanel, footer;
@@ -88,33 +89,13 @@ public final class MainActivity extends Activity {
     private Consumer<Point> pointReceiver;
     private final OnBackInvokedCallback closeExpandedPreview = () -> setExpanded(false);
 
-    private final ServiceConnection connection = new ServiceConnection() {
-        @Override public void onServiceConnected(ComponentName name, IBinder binder) {
-            session = ISurvivalSession.Stub.asInterface(binder);
-            updatePreviewSurface();
-            updateControls();
-            if (quickPanel.getVisibility() == View.VISIBLE) readFeedback();
-            poll();
-        }
-
-        @Override public void onServiceDisconnected(ComponentName name) {
-            disconnected("Shizuku 用户服务已断开");
-        }
-    };
-
-    private final Shizuku.OnBinderReceivedListener received = () -> connect(false);
-    private final Shizuku.OnBinderDeadListener dead = () -> disconnected("请先启动 Shizuku");
-    private final Shizuku.OnRequestPermissionResultListener permission = (request, result) -> {
-        if (request != REQUEST_SHIZUKU) return;
-        if (result == PackageManager.PERMISSION_GRANTED) connect(false);
-        else showStatus("请在 Shizuku 中授权本应用");
-    };
+    private final GameConnection.Listener connectionListener = this::connectionChanged;
     private final Runnable nextPoll = this::poll;
 
     @Override protected void onCreate(Bundle savedState) {
         super.onCreate(savedState);
-        args = new Shizuku.UserServiceArgs(new ComponentName(this, VirtualGameSession.class))
-                .processNameSuffix("survival_session").daemon(false).version(18);
+        gameConnection = AssistantApplication.connection(this);
+        taskHistory = new TaskHistory(this);
         if (Build.VERSION.SDK_INT < 35) {
             getWindow().setDecorFitsSystemWindows(false);
             getWindow().setStatusBarColor(Color.TRANSPARENT);
@@ -122,18 +103,22 @@ public final class MainActivity extends Activity {
         }
         buildUi();
         applySystemBars();
-        Shizuku.addBinderReceivedListenerSticky(received);
-        Shizuku.addBinderDeadListener(dead);
-        Shizuku.addRequestPermissionResultListener(permission);
+        gameConnection.attach(connectionListener);
     }
 
     @Override protected void onStart() {
         super.onStart();
         visible = true;
-        connect(false);
+        gameConnection.connect(false);
         updatePreviewSurface();
+        refreshTaskLog(null);
         if (quickPanel.getVisibility() == View.VISIBLE) readFeedback();
         poll();
+    }
+
+    @Override protected void onResume() {
+        super.onResume();
+        updateBackgroundOptions();
     }
 
     @Override protected void onStop() {
@@ -146,17 +131,7 @@ public final class MainActivity extends Activity {
 
     @Override protected void onDestroy() {
         if (expanded) getOnBackInvokedDispatcher().unregisterOnBackInvokedCallback(closeExpandedPreview);
-        Shizuku.removeBinderReceivedListener(received);
-        Shizuku.removeBinderDeadListener(dead);
-        Shizuku.removeRequestPermissionResultListener(permission);
-        if (bound && Shizuku.pingBinder()) {
-            try {
-                Shizuku.unbindUserService(args, connection, true);
-            } catch (RuntimeException ignored) {
-                // The Binder may have disconnected during teardown.
-            }
-        }
-        bound = false;
+        gameConnection.detach(connectionListener);
         session = null;
         ui.removeCallbacksAndMessages(null);
         if (previewSurface != null) previewSurface.release();
@@ -336,7 +311,7 @@ public final class MainActivity extends Activity {
         quickPanel.setPadding(dp(8), dp(4), dp(8), dp(4));
         quickPanel.setBackground(card(PALE, 12));
         quickPanel.setVisibility(View.GONE);
-        authorize = Screen.button(quickPanel, "连接 Shizuku", () -> connect(true));
+        authorize = Screen.button(quickPanel, "连接 Shizuku", () -> gameConnection.connect(true));
         LinearLayout gameControls = row(quickPanel);
         launch = rowButton(gameControls, "启动游戏", () -> call(ISurvivalSession::launch));
         close = rowButton(gameControls, "关闭游戏", () -> call(ISurvivalSession::closeGame));
@@ -344,6 +319,9 @@ public final class MainActivity extends Activity {
         vibration = rowButton(feedback, "关闭震动", () -> toggleFeedback(0));
         audio = rowButton(feedback, "关闭声音", () -> toggleFeedback(1));
         screenshot = Screen.button(quickPanel, "截图", this::saveScreenshot);
+        battery = Screen.button(quickPanel, "请求电池优化豁免", this::requestBatteryExemption);
+        notifications = Screen.button(quickPanel, "开启后台运行通知",
+                () -> requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQUEST_NOTIFICATIONS));
         footer = row(body);
         footer.setPadding(0, dp(8), 0, 0);
         start = rowButton(footer, "开始任务", this::startSurvival);
@@ -398,7 +376,10 @@ public final class MainActivity extends Activity {
             quickPanel.setVisibility(View.GONE);
             quickOptions.setText("快捷选项");
         }
-        if (tab == LOG_TAB) poll();
+        if (tab == LOG_TAB) {
+            refreshTaskLog(null);
+            poll();
+        }
     }
 
     private void toggleQuickOptions() {
@@ -407,6 +388,7 @@ public final class MainActivity extends Activity {
         quickOptions.setText(show ? "收起选项" : "快捷选项");
         if (show) {
             readFeedback();
+            updateBackgroundOptions();
             quickOptions.post(() -> compact.smoothScrollTo(0, footer.getBottom()));
         }
     }
@@ -468,8 +450,7 @@ public final class MainActivity extends Activity {
         relicLimit.clearFocus();
         WindowInsetsController bars = getWindow().getInsetsController();
         if (bars != null) bars.hide(WindowInsets.Type.ime());
-        String selectedMacro = macroJson;
-        call(service -> service.startSurvival(relicEnabled, limit, selectedMacro));
+        BackgroundTaskService.start(this, relicEnabled, limit, macroJson);
     }
 
     private void setExpanded(boolean show) {
@@ -642,15 +623,12 @@ public final class MainActivity extends Activity {
                         hasGameFrame = frameAvailable;
                         preview.setAlpha(frameAvailable ? 1 : 0);
                     }
-                    if (log != null) {
-                        String content = log.isEmpty() ? "暂无任务日志" : log;
-                        if (!content.contentEquals(taskLog.getText())) taskLog.setText(content);
-                    }
+                    if (log != null) refreshTaskLog(log);
                     updateControls();
                 });
             } catch (RemoteException error) {
                 ui.post(() -> {
-                    if (session == active) disconnected("Shizuku 用户服务已断开");
+                    if (session == active) gameConnection.disconnected("Shizuku 用户服务已断开");
                 });
             } catch (RuntimeException error) {
                 ui.post(() -> {
@@ -710,52 +688,53 @@ public final class MainActivity extends Activity {
         });
     }
 
-    private void connect(boolean interactive) {
-        if (bound || isDestroyed()) return;
-        if (!Shizuku.pingBinder()) {
-            showStatus("请先启动 Shizuku");
-            return;
-        }
+    private void requestBatteryExemption() {
+        Intent request = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                Uri.fromParts("package", getPackageName(), null));
         try {
-            if (Shizuku.getUid() != VirtualGameSession.SHELL_UID || Shizuku.getVersion() < 13) {
-                showStatus("请通过无线调试或 ADB 启动 Shizuku 13 或以上版本");
-                return;
-            }
-            if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
-                showStatus("等待 Shizuku 授权");
-                if (interactive) Shizuku.requestPermission(REQUEST_SHIZUKU);
-                return;
-            }
-            showStatus("正在连接 Shizuku 用户服务…");
-            bound = true;
-            Shizuku.bindUserService(args, connection);
-            ui.postDelayed(() -> {
-                if (bound && session == null) {
-                    try {
-                        Shizuku.unbindUserService(args, connection, true);
-                    } catch (RuntimeException ignored) {
-                        // The service may have stopped before the timeout.
-                    }
-                    disconnected("连接 Shizuku 用户服务超时");
-                }
-            }, 10_000);
-        } catch (RuntimeException error) {
-            disconnected("连接失败 · " + error.getMessage());
+            startActivity(request);
+        } catch (android.content.ActivityNotFoundException | SecurityException error) {
+            Toast.makeText(this, "请在手机系统的电池优化设置中允许本应用", Toast.LENGTH_LONG).show();
         }
     }
 
-    private void disconnected(String message) {
-        touching = false;
-        session = null;
-        bound = false;
-        phase = VirtualGameSession.CLOSED;
-        for (int i = 0; i < feedbackBusy.length; i++) {
-            feedbackBusy[i] = false;
-            feedbackMuted[i] = null;
+    private void updateBackgroundOptions() {
+        boolean exempt = getSystemService(PowerManager.class).isIgnoringBatteryOptimizations(getPackageName());
+        battery.setText(exempt ? "电池优化已豁免" : "请求电池优化豁免");
+        battery.setEnabled(!exempt);
+        notifications.setVisibility(checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                == PackageManager.PERMISSION_GRANTED ? View.GONE : View.VISIBLE);
+    }
+
+    @Override public void onRequestPermissionsResult(int request, String[] permissions, int[] results) {
+        super.onRequestPermissionsResult(request, permissions, results);
+        if (request == REQUEST_NOTIFICATIONS) updateBackgroundOptions();
+    }
+
+    private void refreshTaskLog(String remoteLog) {
+        String content = taskHistory.read();
+        if (content.isEmpty()) content = remoteLog == null || remoteLog.isEmpty() ? "暂无任务日志" : remoteLog;
+        if (!content.contentEquals(taskLog.getText())) taskLog.setText(content);
+    }
+
+    private void connectionChanged(ISurvivalSession active, String message) {
+        if (session != active) {
+            session = active;
+            touching = hasGameFrame = false;
+            phase = VirtualGameSession.CLOSED;
+            preview.setAlpha(0);
+            for (int i = 0; i < feedbackBusy.length; i++) {
+                feedbackBusy[i] = false;
+                feedbackMuted[i] = null;
+            }
+            if (active != null) {
+                updatePreviewSurface();
+                if (quickPanel.getVisibility() == View.VISIBLE) readFeedback();
+                poll();
+            }
         }
-        hasGameFrame = false;
-        preview.setAlpha(0);
-        showStatus(message);
+        if (message != null) showStatus(message);
+        if (activeTab == LOG_TAB) refreshTaskLog(null);
         updateControls();
     }
 
@@ -763,11 +742,11 @@ public final class MainActivity extends Activity {
         boolean connected = session != null;
         boolean hasFrame = connected && hasGameFrame;
         boolean running = phase == VirtualGameSession.RUNNING;
-        authorize.setEnabled(!bound);
+        authorize.setEnabled(!gameConnection.bound());
         launch.setEnabled(connected && phase == VirtualGameSession.CLOSED);
         close.setEnabled(connected && phase != VirtualGameSession.CLOSED);
         start.setEnabled(connected && (running || phase == VirtualGameSession.READY
-                && (relicTask.isChecked() || macroTask.isChecked())));
+                && !gameConnection.hasBackgroundTask() && (relicTask.isChecked() || macroTask.isChecked())));
         start.setAlpha(start.isEnabled() ? 1 : 0.55f);
         start.setText(running ? "停止任务" : "开始任务");
         relicTask.setEnabled(!running);
@@ -791,7 +770,7 @@ public final class MainActivity extends Activity {
         try {
             action.run(session);
         } catch (RemoteException error) {
-            disconnected("Shizuku 用户服务已断开");
+            gameConnection.disconnected("Shizuku 用户服务已断开");
         }
     }
 

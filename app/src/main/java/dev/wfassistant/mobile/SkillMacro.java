@@ -19,10 +19,18 @@ import java.util.List;
 
 record SkillMacro(String name, List<Action> actions) {
     enum Kind {
-        TAP("触屏点按"), HOLD("触屏长按"), WAIT("等待"), GAMEPAD("手柄按键"), JOYSTICK("手柄摇杆");
+        TAP("触屏点按"), HOLD("触屏长按"), WAIT("等待"),
+        GAMEPAD_DOWN("手柄按键按下"), GAMEPAD_UP("手柄按键松开"),
+        JOYSTICK_MOVE("推摇杆"), JOYSTICK_CENTER("松开摇杆"),
+        GAMEPAD("手柄按键（定时）"), JOYSTICK("手柄摇杆（定时）");
 
         final String label;
         Kind(String label) { this.label = label; }
+
+        boolean isKey() { return this == GAMEPAD || this == GAMEPAD_DOWN || this == GAMEPAD_UP; }
+        boolean isStick() { return this == JOYSTICK || this == JOYSTICK_MOVE || this == JOYSTICK_CENTER; }
+        boolean isRelease() { return this == GAMEPAD_UP || this == JOYSTICK_CENTER; }
+        boolean isInstant() { return this == GAMEPAD_DOWN || this == JOYSTICK_MOVE || isRelease(); }
     }
 
     enum Stick {
@@ -66,20 +74,17 @@ record SkillMacro(String name, List<Action> actions) {
             this(kind, x, y, key, milliseconds, null, null);
         }
 
-        static Action joystick(Stick stick, Direction direction, int milliseconds) {
-            return new Action(Kind.JOYSTICK, 0, 0, 0, milliseconds, stick, direction);
-        }
-
         Action {
-            if (milliseconds < 0 || (kind != Kind.WAIT && milliseconds == 0)) {
+            if (kind.isInstant() ? milliseconds != 0
+                    : milliseconds < 0 || (kind != Kind.WAIT && milliseconds == 0)) {
                 throw new IllegalArgumentException("请填写有效的毫秒数");
             }
             if ((kind == Kind.TAP || kind == Kind.HOLD)
                     && (x < 0 || x >= VirtualGameSession.WIDTH || y < 0 || y >= VirtualGameSession.HEIGHT)) {
                 throw new IllegalArgumentException("触屏坐标必须在游戏画面内");
             }
-            if (kind == Kind.GAMEPAD && keyIndex(key) < 0) throw new IllegalArgumentException("未知手柄键");
-            if (kind == Kind.JOYSTICK && (stick == null || direction == null)) {
+            if (kind.isKey() && keyIndex(key) < 0) throw new IllegalArgumentException("未知手柄键");
+            if (kind.isStick() && (stick == null || (kind != Kind.JOYSTICK_CENTER && direction == null))) {
                 throw new IllegalArgumentException("请选择摇杆和方向");
             }
         }
@@ -96,6 +101,9 @@ record SkillMacro(String name, List<Action> actions) {
                 case WAIT -> duration;
                 case GAMEPAD -> GAMEPAD_LABELS[keyIndex(key)] + " · " + duration;
                 case JOYSTICK -> stick.label + direction.label + " · " + duration;
+                case GAMEPAD_DOWN, GAMEPAD_UP -> GAMEPAD_LABELS[keyIndex(key)];
+                case JOYSTICK_MOVE -> stick.label + direction.label;
+                case JOYSTICK_CENTER -> stick.label;
             };
         }
     }
@@ -117,12 +125,14 @@ record SkillMacro(String name, List<Action> actions) {
     JSONObject toJson() throws JSONException {
         JSONArray steps = new JSONArray();
         for (Action action : actions) {
-            JSONObject step = new JSONObject().put("type", action.kind().name())
-                    .put("ms", action.milliseconds());
+            JSONObject step = new JSONObject().put("type", action.kind().name());
+            if (!action.kind().isInstant()) step.put("ms", action.milliseconds());
             switch (action.kind()) {
                 case TAP, HOLD -> step.put("x", action.x()).put("y", action.y());
-                case GAMEPAD -> step.put("key", KeyEvent.keyCodeToString(action.key()));
-                case JOYSTICK -> step.put("stick", action.stick().name()).put("direction", action.direction().name());
+                case GAMEPAD, GAMEPAD_DOWN, GAMEPAD_UP -> step.put("key", KeyEvent.keyCodeToString(action.key()));
+                case JOYSTICK, JOYSTICK_MOVE ->
+                        step.put("stick", action.stick().name()).put("direction", action.direction().name());
+                case JOYSTICK_CENTER -> step.put("stick", action.stick().name());
                 case WAIT -> {}
             }
             steps.put(step);
@@ -137,13 +147,15 @@ record SkillMacro(String name, List<Action> actions) {
             try {
                 JSONObject step = steps.getJSONObject(i);
                 Kind kind = enumValue(step, "type", Kind.class);
-                int duration = integer(step, "ms");
+                int duration = kind.isInstant() && !step.has("ms") ? 0 : integer(step, "ms");
                 decoded.add(switch (kind) {
                     case TAP, HOLD -> new Action(kind, integer(step, "x"), integer(step, "y"), 0, duration);
                     case WAIT -> new Action(kind, 0, 0, 0, duration);
-                    case GAMEPAD -> new Action(kind, 0, 0, KeyEvent.keyCodeFromString(string(step, "key")), duration);
-                    case JOYSTICK -> Action.joystick(enumValue(step, "stick", Stick.class),
-                            enumValue(step, "direction", Direction.class), duration);
+                    case GAMEPAD, GAMEPAD_DOWN, GAMEPAD_UP ->
+                            new Action(kind, 0, 0, KeyEvent.keyCodeFromString(string(step, "key")), duration);
+                    case JOYSTICK, JOYSTICK_MOVE, JOYSTICK_CENTER ->
+                            new Action(kind, 0, 0, 0, duration, enumValue(step, "stick", Stick.class),
+                                    kind == Kind.JOYSTICK_CENTER ? null : enumValue(step, "direction", Direction.class));
                 });
             } catch (JSONException | IllegalArgumentException error) {
                 throw new JSONException("第 " + (i + 1) + " 步 · " + error.getMessage());

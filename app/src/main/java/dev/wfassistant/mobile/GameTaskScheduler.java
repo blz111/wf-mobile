@@ -13,7 +13,11 @@ final class GameTaskScheduler {
     enum State { NORMAL, SELECTING_RELIC }
     enum Decision { WAIT, CHECK_SOON, WAIT_FOR_RELEASE, RETURN_TO_NORMAL, FINISHED }
 
-    record Step(Decision decision, String status) {}
+    record Step(Decision decision, String status, int delayMs) {
+        Step(Decision decision, String status) {
+            this(decision, status, INTERACTION_INTERVAL_MS);
+        }
+    }
     record Tick(String status, int delayMs, boolean finished) {}
 
     @FunctionalInterface
@@ -66,7 +70,7 @@ final class GameTaskScheduler {
             Step step = task.run(state, frame, tap);
             if (step.status() != null) status = status == null ? step.status() : status + " · " + step.status();
             switch (step.decision()) {
-                case CHECK_SOON -> delay = INTERACTION_INTERVAL_MS;
+                case CHECK_SOON -> delay = Math.min(delay, step.delayMs());
                 case WAIT_FOR_RELEASE -> {
                     waitingForRelease = true;
                     delay = INTERACTION_INTERVAL_MS;
