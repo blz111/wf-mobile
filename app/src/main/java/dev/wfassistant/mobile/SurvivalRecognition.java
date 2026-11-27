@@ -5,6 +5,8 @@ import android.util.Base64;
 import java.util.BitSet;
 
 final class SurvivalRecognition {
+    enum Confirmation { NONE, EQUIP, WITHOUT_RELIC }
+
     private static final Anchor EQUIP = new Anchor(750, 596, 117, 20, false,
             "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYQAGAACAYQACAAAAGAAkDMAAGGAwDGD+wfABA4D1H/4HMwyGAcY/+B/wP4D+42FgjuH9YQCAyYADAxgGdgeMMb4/ZAA4GPg4wMMAfIBhBsMGDAAHA/ADTP/w/zFAYMjA/PNgwP8HCAAPPAYM3BkcGN7/PPgAGMD/wYDhe+MDA/sfMAD+//g/mDE8fmhgYDDg/wFYAGMGPwfGDwwMDAb8P+DZ4f/g8cGMgYGBwQAMBh8OjBked5ihMDAwGMBAAL+H/4NwDBscBgb2Pw4M4MHxfwAGcYPD8MD+5/ABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
     // 未选中遗物时的提示「选择一个遗物来查看其奖励」，模板不含两侧的图标。
@@ -18,6 +20,12 @@ final class SurvivalRecognition {
     private static final Anchor PROMPT = new Anchor(359, 288, 119, 26, true,
             "AAAAAAAAAAAAAAAAAAAAAGAAAGAAAAAAAGDAAAAG/zAAAHAA8P//AzBgAACDf/gHADAAAB4DwBkwAMAPBgYD/v8/AIYBgO3/B/AHgcEAAwAYAMMAAPb/Ax7AwDCAAQAI/P8fAAMGgBtg8P/BAAAExzAMgAEDYDgw/P9gAACCYRgE8IABAHgIHkOA/z/AMAwCb8AAADx+jCGA/x9gGIbBMf8fwAd/xhAAMADw//8AmP8P/sAx/w8AGAAAHgAADACAH+CYMQYYDAAABgAAwAAA/nPMGAIMBgCAAQAA4AAA/yFmDAEG/4H//z/8//+BwRAzhgCD/wA44AAANgDAYIj5f4DBAAAMMADAMRhgMMSMMeBhAAAHHAA4MAfwH2bDEPAxAIAPB4Af+AAYDL9hCMwZAAD/AeAMeAAMhmEwBMYPAAD+AwCGcQAGQzAYg4H/H+DHDwD/8AD/AQjgYQD/j38AHsAH4ID/AAAAAAAAAAAABAAAAEAAAAAAAAAAAAAAAAAAAAAA");
 
+    // 「不选择虚空」片段和左上格右上角的选中标记，来自两张原尺寸截图。
+    private static final Anchor NO_RELIC_PROMPT = new Anchor(412, 288, 132, 26, true,
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAQAAAAMAABgAAAAAwIARABD+PwAwAACAAYD//z8YGAEA4f8DAP8HADgAAMADAMP/BxAYGAAwAOD//wcAHABw/H+AAYMBAAMA/v9/AMAAAGI4AP9gDvD//2AAAAQADgAABgHgD3wA//8PBgBAAPAAAAAQABDAAxAwwGAwGASALwAAgAMAAX4AAX8EwAEHAPwOAOD/DxA8PJD/AQAOwAHgzAE+cA4A8QAPAQMIOAA4AMdwAANGAPCBARAwwMABAAI4DA4gIASADxgAAf4PAAAA4MHAAQJDAD/8PxAAAAD//wEHDDggMASwwf8DgTEAADgAOMAAA4JBGBCAAZgYYwCAAQAADAAgHIQBARiAmTEDABgAAMAAAPLADxCAARgZMwCAAQAADAAgA/wA4f+PsbEBABgAAMAAAAcAABCAARgbCwCAAQAADAD4AQAAARjAgDEAABgAAMAAwPCBDxiAAcz//8D//wcABAAE/P/gARhA/v8P/P9/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    private static final Anchor NO_RELIC_SELECTED = new Anchor(155, 132, 23, 21, false,
+            "AAAA/v8f/P8P/P8H/P8D/P8B/P8A/H8A/D8A/B8A/A8A/AcA/AMA/AEA/AAAfAAAPAAAHAAADAAABAAAAA==");
+
     boolean relicSelection(Bitmap screenshot) {
         // 手柄模式的提示图标会把按钮文字向右推约 12 像素。
         return EQUIP.matches(screenshot, 16, 2, 0.75);
@@ -27,10 +35,16 @@ final class SurvivalRecognition {
         return SELECT_RELIC_HINT.matches(screenshot, 3, 2, 0.75);
     }
 
-    boolean relicConfirmation(Bitmap screenshot) {
-        return YES.matches(screenshot, 2, 2, 0.78)
-                && NO.matches(screenshot, 2, 2, 0.78)
-                && PROMPT.matches(screenshot, 56, 5, 0.75);
+    boolean noRelicSelected(Bitmap screenshot) {
+        return NO_RELIC_SELECTED.matches(screenshot, 2, 2, 0.78);
+    }
+
+    Confirmation relicConfirmation(Bitmap screenshot) {
+        if (screenshot == null || !YES.matches(screenshot, 2, 2, 0.78)
+                || !NO.matches(screenshot, 2, 2, 0.78)) return Confirmation.NONE;
+        if (NO_RELIC_PROMPT.matches(screenshot, 8, 4, 0.78)) return Confirmation.WITHOUT_RELIC;
+        if (PROMPT.matches(screenshot, 56, 5, 0.75)) return Confirmation.EQUIP;
+        return Confirmation.NONE;
     }
 
     private record Anchor(int x, int y, int width, int height, boolean white, BitSet mask) {

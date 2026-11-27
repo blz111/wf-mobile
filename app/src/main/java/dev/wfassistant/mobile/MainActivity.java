@@ -28,6 +28,7 @@ import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.TextureView;
 import android.view.View;
+import android.view.ViewGroup;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.window.OnBackInvokedCallback;
@@ -79,7 +80,7 @@ public final class MainActivity extends Activity {
     private Button battery, notifications;
     private final Button[] tabs = new Button[3];
     private final LinearLayout[] panels = new LinearLayout[3];
-    private LinearLayout relicSettings, macroSettings, quickPanel, footer;
+    private LinearLayout tabContent, relicSettings, macroSettings, quickPanel, footer;
     private TextView relicLabel, macroLabel;
     private CheckBox relicTask, macroTask;
     private EditText relicLimit;
@@ -149,7 +150,25 @@ public final class MainActivity extends Activity {
     private void buildUi() {
         FrameLayout root = new FrameLayout(this);
         root.setBackgroundColor(Color.BLACK);
-        compact = new ScrollView(this);
+        compact = new ScrollView(this) {
+            @Override protected void measureChildWithMargins(View child, int widthSpec, int widthUsed,
+                                                             int heightSpec, int heightUsed) {
+                if (activeTab != LOG_TAB) {
+                    super.measureChildWithMargins(child, widthSpec, widthUsed, heightSpec, heightUsed);
+                    return;
+                }
+                // The log tab uses the screen as its viewport and scrolls only its log pane.
+                ViewGroup.MarginLayoutParams margins = (ViewGroup.MarginLayoutParams) child.getLayoutParams();
+                int horizontal = getPaddingLeft() + getPaddingRight() + margins.leftMargin + margins.rightMargin;
+                int vertical = getPaddingTop() + getPaddingBottom() + margins.topMargin + margins.bottomMargin;
+                child.measure(getChildMeasureSpec(widthSpec, horizontal + widthUsed, margins.width),
+                        getChildMeasureSpec(heightSpec, vertical + heightUsed, margins.height));
+            }
+
+            @Override public boolean onInterceptTouchEvent(MotionEvent event) {
+                return activeTab != LOG_TAB && super.onInterceptTouchEvent(event);
+            }
+        };
         compact.setFillViewport(true);
         compact.setBackgroundColor(Color.rgb(244, 248, 247));
         compact.setOnApplyWindowInsetsListener((view, insets) -> {
@@ -162,7 +181,7 @@ public final class MainActivity extends Activity {
         body.setOrientation(LinearLayout.VERTICAL);
         body.setFocusableInTouchMode(true);
         body.setPadding(dp(16), dp(12), dp(16), dp(16));
-        compact.addView(body);
+        compact.addView(body, new ScrollView.LayoutParams(-1, -1));
         root.addView(compact);
         smallPreview = new FrameLayout(this);
         smallPreview.setBackground(card(0xff152327, 14));
@@ -247,10 +266,9 @@ public final class MainActivity extends Activity {
             tabs[i] = rowButton(tabBar, titles[i], () -> showTab(tab));
             tabs[i].setMinHeight(dp(42));
         }
-        LinearLayout content = column(body);
-        content.setLayoutParams(new LinearLayout.LayoutParams(-1, -2, 1));
-        content.setPadding(0, dp(10), 0, dp(8));
-        for (int i = 0; i < panels.length; i++) panels[i] = column(content);
+        tabContent = column(body);
+        tabContent.setPadding(0, dp(10), 0, dp(8));
+        for (int i = 0; i < panels.length; i++) panels[i] = column(tabContent);
 
         LinearLayout taskSplit = row(panels[TASK_TAB]);
         taskSplit.setMinimumHeight(dp(156));
@@ -301,10 +319,16 @@ public final class MainActivity extends Activity {
         });
 
         LinearLayout logPanel = panels[LOG_TAB];
+        logPanel.setLayoutParams(new LinearLayout.LayoutParams(-1, -1));
         logPanel.setPadding(dp(12), dp(8), dp(12), dp(12));
         logPanel.setBackground(card(Color.WHITE, 12));
-        taskLog = Screen.text(logPanel, "暂无任务日志");
-        taskLog.setMinHeight(dp(140));
+        ScrollView logScroll = new ScrollView(this);
+        logScroll.setFillViewport(true);
+        logPanel.addView(logScroll, new LinearLayout.LayoutParams(-1, -1));
+        LinearLayout logContent = new LinearLayout(this);
+        logContent.setOrientation(LinearLayout.VERTICAL);
+        logScroll.addView(logContent, new ScrollView.LayoutParams(-1, -2));
+        taskLog = Screen.text(logContent, "暂无任务日志");
         taskLog.setTextIsSelectable(true);
 
         quickPanel = column(body);
@@ -367,6 +391,7 @@ public final class MainActivity extends Activity {
 
     private void showTab(int tab) {
         activeTab = tab;
+        tabContent.setLayoutParams(new LinearLayout.LayoutParams(-1, tab == LOG_TAB ? 0 : -2, 1));
         for (int i = 0; i < panels.length; i++) {
             panels[i].setVisibility(i == tab ? View.VISIBLE : View.GONE);
             tabs[i].setBackground(card(i == tab ? ACCENT : PALE, 9));
@@ -379,6 +404,7 @@ public final class MainActivity extends Activity {
             quickOptions.setText("快捷选项");
         }
         if (tab == LOG_TAB) {
+            compact.scrollTo(0, 0);
             refreshTaskLog(null);
             poll();
         }

@@ -52,7 +52,8 @@ final class GameTaskScheduler {
     Tick runFrame(Bitmap frame, Tap tap) throws Exception {
         waitingForRelease = false;
         if (screenOwner == null && frame != null) {
-            state = recognition.relicSelection(frame) || recognition.relicConfirmation(frame)
+            state = recognition.relicSelection(frame)
+                    || recognition.relicConfirmation(frame) != SurvivalRecognition.Confirmation.NONE
                     ? State.SELECTING_RELIC : State.NORMAL;
             if (state != State.NORMAL) pauseNormalTasks();
             for (Task task : tasks) {
