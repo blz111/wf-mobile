@@ -120,9 +120,8 @@ final class MacroTask implements GameTaskScheduler.Task {
 
     private void releasePressed() throws Exception {
         if (pressed == null) return;
-        SkillMacro.Action action = pressed;
+        input.release(pressed);
         pressed = null;
-        input.release(action);
     }
 
     @Override public String progress() { return "技能宏 " + macro.name(); }

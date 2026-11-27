@@ -75,7 +75,7 @@ public final class MainActivity extends Activity {
     private TextureView preview;
     private Surface previewSurface;
     private int previewWidth, previewHeight;
-    private Button authorize, launch, close, start, screenshot, vibration, audio, quickOptions;
+    private Button authorize, launch, close, start, screenshot, lockScreen, vibration, audio, quickOptions;
     private Button battery, notifications;
     private final Button[] tabs = new Button[3];
     private final LinearLayout[] panels = new LinearLayout[3];
@@ -318,7 +318,9 @@ public final class MainActivity extends Activity {
         LinearLayout feedback = row(quickPanel);
         vibration = rowButton(feedback, "关闭震动", () -> toggleFeedback(0));
         audio = rowButton(feedback, "关闭声音", () -> toggleFeedback(1));
-        screenshot = Screen.button(quickPanel, "截图", this::saveScreenshot);
+        LinearLayout displayControls = row(quickPanel);
+        screenshot = rowButton(displayControls, "截图", this::saveScreenshot);
+        lockScreen = rowButton(displayControls, "锁屏", () -> call(ISurvivalSession::lockScreen));
         battery = Screen.button(quickPanel, "请求电池优化豁免", this::requestBatteryExemption);
         notifications = Screen.button(quickPanel, "开启后台运行通知",
                 () -> requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQUEST_NOTIFICATIONS));
@@ -754,6 +756,7 @@ public final class MainActivity extends Activity {
         relicLimit.setEnabled(!running);
         macroPicker.setEnabled(!running && !macroEditor.macros().isEmpty());
         screenshot.setEnabled(hasFrame && !saving);
+        lockScreen.setEnabled(connected);
         feedbackButton(vibration, 0, "震动", connected);
         feedbackButton(audio, 1, "声音", connected);
     }

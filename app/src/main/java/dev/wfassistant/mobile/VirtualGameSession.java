@@ -58,6 +58,9 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
     static final int WIDTH = 1280, HEIGHT = 720;
     private static final int MANUAL_TOUCH_SETTLE_MS = 250;
     private static final int GAME_TASK_WATCH_MS = 1_500;
+    private static final int INPUT_RELEASE_RETRIES = 3;
+    private static final int INPUT_RELEASE_RETRY_MS = 200;
+    private static final String INPUT_RELEASE_PENDING = " · 宏输入释放待重试";
     private static final int DISPLAY_ALWAYS_UNLOCKED = 1 << 9;
     private static final String GAME = "com.digitalextremes.warframemobile";
     private static final DateTimeFormatter LOG_TIME = DateTimeFormatter.ofPattern("HH:mm:ss");
@@ -97,6 +100,7 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
     private ScheduledFuture<?> powerKeepAlive;
     private ScheduledFuture<?> gameTaskWatch;
     private GameTaskScheduler taskScheduler;
+    private GameTaskScheduler releasingTasks;
     private long lastManualTouch;
     private long gestureStart;
     private int[] activeIds;
@@ -319,6 +323,15 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
             Object task = findGameTask(id, false);
             if (task == null) restoreMovedTask(id);
             else trackGameTask(task, id);
+            if (phase == READY && releasingTasks != null) {
+                ComponentName top = previewActivity(task);
+                if (top != null && GAME.equals(top.getPackageName()) && tryReleaseTaskInputs() == null) {
+                    if (message.endsWith(INPUT_RELEASE_PENDING)) {
+                        message = message.substring(0, message.length() - INPUT_RELEASE_PENDING.length());
+                    }
+                    logEvent("已完成宏输入释放");
+                }
+            }
         } catch (Exception error) {
             Log.w("WarframeTask", "Could not verify Warframe task", error);
         }
@@ -452,6 +465,7 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
                 return false;
             }
             try {
+                releaseTaskInputs();
                 List<GameTaskScheduler.Task> tasks = new ArrayList<>();
                 if (relicEnabled) tasks.add(new RelicTask(limit));
                 if (macroJson != null && !macroJson.isBlank()) {
@@ -595,11 +609,11 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
     }
 
     private void failTasks(Exception error) {
-        cancelPending();
-        clearTasks();
-        cancelTouches();
         report(error);
-        if (phase == RUNNING) phase = READY;
+        if (phase == RUNNING) {
+            beginTaskStop(message);
+            cancelTouches();
+        }
     }
 
     private void checkTarget() throws Exception {
@@ -863,12 +877,58 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
 
     @Override public void stopSurvival() {
         worker.execute(() -> {
-            if (phase != RUNNING) return;
-            cancelPending();
-            message = taskScheduler.stopMessage();
-            clearTasks();
-            phase = READY;
-            logEvent(message);
+            if (taskScheduler == null) return;
+            beginTaskStop(taskScheduler.stopMessage());
+        });
+    }
+
+    private void beginTaskStop(String result) {
+        cancelPending();
+        detachTasks();
+        completeTaskStop(result, INPUT_RELEASE_RETRIES);
+    }
+
+    private void completeTaskStop(String result, int retries) {
+        pending = null;
+        Exception failure = tryReleaseTaskInputs();
+        if (failure != null && retries > 0) {
+            message = "正在停止任务 · 释放宏输入";
+            pending = worker.schedule(() -> completeTaskStop(result, retries - 1),
+                    INPUT_RELEASE_RETRY_MS, TimeUnit.MILLISECONDS);
+            return;
+        }
+        String status = result;
+        if (failure != null) {
+            Exception detail = failure.getSuppressed().length > 0
+                    && failure.getSuppressed()[0] instanceof Exception suppressed ? suppressed : failure;
+            logEvent("释放宏输入失败 · " + detail.getMessage());
+            status += INPUT_RELEASE_PENDING;
+        }
+        if (!status.equals(message)) logEvent(status);
+        message = status;
+        phase = READY;
+    }
+
+    @Override public void lockScreen() {
+        displayPowerWorker.execute(() -> {
+            try {
+                DisplayManager manager = shellContext.getSystemService(DisplayManager.class);
+                Display mainDisplay = manager.getDisplay(Display.DEFAULT_DISPLAY);
+                if (mainDisplay == null) throw new IOException("未找到手机主屏");
+                command("/system/bin/input", "-d", String.valueOf(Display.DEFAULT_DISPLAY), "keyevent", "KEYCODE_SLEEP");
+                long deadline = SystemClock.uptimeMillis() + 1_200;
+                do {
+                    int state = mainDisplay.getState();
+                    if (state == Display.STATE_OFF || state == Display.STATE_DOZE || state == Display.STATE_DOZE_SUSPEND) {
+                        logEvent("手机主屏已熄灭");
+                        return;
+                    }
+                    SystemClock.sleep(100);
+                } while (SystemClock.uptimeMillis() < deadline);
+                throw new IOException("主屏仍亮着，请查看系统锁屏设置");
+            } catch (Exception error) {
+                report(new IOException("锁屏失败 · " + error.getMessage(), error));
+            }
         });
     }
 
@@ -897,15 +957,25 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
         pending = null;
     }
 
-    private void clearTasks() {
-        GameTaskScheduler active = taskScheduler;
+    private void detachTasks() {
+        if (taskScheduler == null) return;
+        releasingTasks = taskScheduler;
         taskScheduler = null;
-        if (active == null) return;
+    }
+
+    private void releaseTaskInputs() throws Exception {
+        if (releasingTasks == null) return;
+        releasingTasks.pauseNormalTasks();
+        releasingTasks = null;
+    }
+
+    private Exception tryReleaseTaskInputs() {
         try {
-            active.pauseNormalTasks();
+            releaseTaskInputs();
+            return null;
         } catch (Exception error) {
             Log.w("WarframeSurvival", "Could not release macro input", error);
-            logEvent("释放宏输入失败");
+            return error;
         }
     }
 
@@ -917,7 +987,9 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
         gameTaskWatch = null;
         trackedTaskId = recentsHandledTaskId = -1;
         lastTaskMove = 0;
-        clearTasks();
+        detachTasks();
+        tryReleaseTaskInputs();
+        releasingTasks = null;
         cancelTouches();
         phase = CLOSED;
         if (virtualGameDisplay != null) virtualGameDisplay.close();

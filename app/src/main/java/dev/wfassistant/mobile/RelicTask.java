@@ -18,13 +18,13 @@ final class RelicTask implements GameTaskScheduler.Task {
     // 第一排首个实际遗物，左边是「不装备遗物」。
     private static final int FIRST_RELIC_X = 256, FIRST_RELIC_Y = 185;
 
-    private enum Stage { EQUIP, CONFIRM, WAIT_FOR_CLOSE, WAIT_FOR_COUNTED_CLOSE }
+    private enum Stage { EQUIP, CONFIRM, DISMISS_CONFIRMATION, WAIT_FOR_CLOSE, WAIT_FOR_COUNTED_CLOSE }
 
     private final SurvivalRecognition recognition = new SurvivalRecognition();
     private final int limit;
     private Stage stage = Stage.EQUIP;
     private long equipped;
-    private long nextEquipRetryAt, confirmationDeadline;
+    private long nextEquipRetryAt, confirmationDeadline, nextDismissRetryAt;
 
     RelicTask(int limit) {
         this.limit = limit;
@@ -37,18 +37,20 @@ final class RelicTask implements GameTaskScheduler.Task {
         return switch (stage) {
             case EQUIP -> equip(frame, tap);
             case CONFIRM -> confirm(frame, tap);
-            case WAIT_FOR_CLOSE, WAIT_FOR_COUNTED_CLOSE -> waitForClose(frame);
+            case DISMISS_CONFIRMATION -> dismissConfirmation(frame, tap);
+            case WAIT_FOR_CLOSE, WAIT_FOR_COUNTED_CLOSE -> waitForClose(frame, tap);
         };
     }
 
     private Step equip(Bitmap frame, Tap tap) throws Exception {
         if (frame == null) return new Step(Decision.CHECK_SOON, null);
         if (recognition.relicConfirmation(frame)) {
-            return step(Decision.WAIT, "等待核桃确认框关闭");
+            return startDismissal(tap);
         }
         if (!recognition.relicSelection(frame)) {
             return step(Decision.RETURN_TO_NORMAL, "等待选核桃页面");
         }
+        if (SystemClock.uptimeMillis() < nextEquipRetryAt) return new Step(Decision.CHECK_SOON, null);
         return selectOrEquip(frame, tap, false);
     }
 
@@ -67,9 +69,9 @@ final class RelicTask implements GameTaskScheduler.Task {
         if (result == TapResult.MANUAL_TOUCH_ACTIVE) return retryTap(result, operation);
         long now = SystemClock.uptimeMillis();
         nextEquipRetryAt = now + EQUIP_RETRY_MS;
+        if (result == TapResult.REJECTED) return retryTap(result, operation);
         confirmationDeadline = now + CONFIRM_TIMEOUT_MS;
         stage = Stage.CONFIRM;
-        if (result == TapResult.REJECTED) return retryTap(result, operation);
         return step(Decision.CHECK_SOON, retry ? "确认框未出现 · 已重试点击装备" : "已点击装备以执行任务 · 等待确认框");
     }
 
@@ -91,8 +93,37 @@ final class RelicTask implements GameTaskScheduler.Task {
         return step(Decision.WAIT, "未识别到核桃确认框 · 等待页面关闭");
     }
 
-    private Step waitForClose(Bitmap frame) {
-        if (frame == null || recognition.relicSelection(frame) || recognition.relicConfirmation(frame)) {
+    private Step startDismissal(Tap tap) throws Exception {
+        stage = Stage.DISMISS_CONFIRMATION;
+        nextDismissRetryAt = 0;
+        return tapNo(tap);
+    }
+
+    private Step dismissConfirmation(Bitmap frame, Tap tap) throws Exception {
+        if (frame == null) return new Step(Decision.CHECK_SOON, null);
+        if (recognition.relicConfirmation(frame)) return tapNo(tap);
+        stage = Stage.EQUIP;
+        nextEquipRetryAt = 0;
+        return step(Decision.CHECK_SOON, "核桃确认框已关闭 · 重新检查选核桃页面");
+    }
+
+    private Step tapNo(Tap tap) throws Exception {
+        long now = SystemClock.uptimeMillis();
+        if (now < nextDismissRetryAt) return new Step(Decision.CHECK_SOON, null);
+        String operation = "取消意外出现的核桃确认框";
+        TapResult result = tap.whenIdle(operation, new Point(774, 402));
+        if (result == TapResult.MANUAL_TOUCH_ACTIVE) return retryTap(result, operation);
+        nextDismissRetryAt = now + EQUIP_RETRY_MS;
+        if (result == TapResult.REJECTED) return retryTap(result, operation);
+        return step(Decision.CHECK_SOON, "意外出现核桃确认框 · 已点击否，等待关闭");
+    }
+
+    private Step waitForClose(Bitmap frame, Tap tap) throws Exception {
+        if (frame == null) return new Step(Decision.WAIT, null);
+        if (recognition.relicConfirmation(frame)) {
+            return stage == Stage.WAIT_FOR_CLOSE ? startDismissal(tap) : new Step(Decision.WAIT, null);
+        }
+        if (recognition.relicSelection(frame)) {
             return new Step(Decision.WAIT, null);
         }
         if (stage == Stage.WAIT_FOR_COUNTED_CLOSE) equipped++;

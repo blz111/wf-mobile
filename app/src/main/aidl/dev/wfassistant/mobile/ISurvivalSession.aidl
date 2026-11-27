@@ -19,5 +19,6 @@ interface ISurvivalSession {
     boolean isGameAudioMuted() = 12;
     boolean setGameAudioMuted(boolean muted) = 13;
     String taskLog() = 14;
+    void lockScreen() = 15;
     void destroy() = 16777114;
 }
