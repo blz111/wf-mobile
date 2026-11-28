@@ -4,15 +4,28 @@ import android.app.ActivityManager;
 import android.app.ApplicationExitInfo;
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.util.AtomicFile;
 import android.util.Log;
 
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.time.Instant;
 import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.Locale;
 
 final class TaskHistory {
     private static final String STARTED_AT = "started_at";
     private static final String LOG = "log";
+    private static final String LOG_STARTED_AT = "log_started_at";
     private static final DateTimeFormatter DATE_TIME = DateTimeFormatter.ofPattern("MM-dd HH:mm:ss");
+    private static final DateTimeFormatter FILE_TIME = DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss-SSS", Locale.ROOT);
 
     private final Context context;
     private final SharedPreferences prefs;
@@ -22,8 +35,13 @@ final class TaskHistory {
         prefs = context.getSharedPreferences("background_task", Context.MODE_PRIVATE);
     }
 
-    void begin(String details) {
-        prefs.edit().putLong(STARTED_AT, System.currentTimeMillis()).putString(LOG, line(details)).apply();
+    void begin(String details) throws IOException {
+        long now = System.currentTimeMillis();
+        String previous = read();
+        if (!previous.isEmpty()) {
+            archive(previous, prefs.getLong(LOG_STARTED_AT, prefs.getLong(STARTED_AT, now)));
+        }
+        prefs.edit().putLong(STARTED_AT, now).putLong(LOG_STARTED_AT, now).putString(LOG, line(details)).apply();
     }
 
     void update(String text) {
@@ -36,6 +54,44 @@ final class TaskHistory {
 
     String read() {
         return prefs.getString(LOG, "");
+    }
+
+    File[] archives() {
+        File[] files = archiveDirectory().listFiles((dir, name) -> name.endsWith(".log"));
+        if (files == null) return new File[0];
+        Arrays.sort(files, Comparator.comparing(File::getName).reversed());
+        return files;
+    }
+
+    String readArchive(File file) throws IOException {
+        return new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8);
+    }
+
+    private File archiveDirectory() {
+        return new File(context.getFilesDir(), "task-logs");
+    }
+
+    private void archive(String previous, long time) throws IOException {
+        File directory = archiveDirectory();
+        if (!directory.isDirectory() && !directory.mkdirs() && !directory.isDirectory()) {
+            throw new IOException("无法创建历史日志目录");
+        }
+        String stamp = FILE_TIME.format(Instant.ofEpochMilli(time).atZone(ZoneId.systemDefault()));
+        File destination = new File(directory, stamp + ".log");
+        for (int suffix = 2; destination.exists(); suffix++) {
+            if (previous.equals(readArchive(destination))) return;
+            destination = new File(directory, stamp + "_" + suffix + ".log");
+        }
+        AtomicFile archive = new AtomicFile(destination);
+        FileOutputStream output = archive.startWrite();
+        try {
+            output.write(previous.getBytes(StandardCharsets.UTF_8));
+            archive.finishWrite(output);
+        } catch (IOException error) {
+            archive.failWrite(output);
+            throw error;
+        }
+        if (!destination.isFile()) throw new IOException("无法保存历史日志");
     }
 
     void recoverInterruptedRun() {

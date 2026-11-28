@@ -20,5 +20,7 @@ interface ISurvivalSession {
     boolean setGameAudioMuted(boolean muted) = 13;
     String taskLog() = 14;
     void lockScreen() = 15;
+    // First element is the sequence number of the first returned entry.
+    String[] taskLogSince(long after) = 16;
     void destroy() = 16777114;
 }

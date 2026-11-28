@@ -64,12 +64,12 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
     private static final int DISPLAY_ALWAYS_UNLOCKED = 1 << 9;
     private static final String GAME = "com.digitalextremes.warframemobile";
     private static final DateTimeFormatter LOG_TIME = DateTimeFormatter.ofPattern("HH:mm:ss");
+    private static final int OWN_DISPLAY_GROUP = 1 << 11;
     private static final int DISPLAY_FLAGS = DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC
             | DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
             | (1 << 6)   // SUPPORTS_TOUCH
             | (1 << 8)   // DESTROY_CONTENT_ON_REMOVAL
             | (1 << 10)  // TRUSTED
-            | (1 << 11)  // OWN_DISPLAY_GROUP
             | (1 << 14)  // OWN_FOCUS
             | (1 << 16); // STEAL_TOP_FOCUS_DISABLED
     private static final int NON_STEALING_FOCUS = (1 << 11) | (1 << 12);
@@ -80,6 +80,7 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
             new Thread(task, "wf-display-power"));
     private final AtomicInteger queuedManualTouches = new AtomicInteger();
     private final ArrayDeque<String> log = new ArrayDeque<>();
+    private long logSequence;
     private volatile String message = "Shizuku 已连接";
     private volatile int phase = CLOSED;
     private VirtualDisplay display;
@@ -128,9 +129,30 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
 
     @Override public synchronized String taskLog() { return String.join("\n", log); }
 
+    @Override public synchronized String[] taskLogSince(long after) {
+        if (after >= logSequence || log.isEmpty()) return new String[0];
+        long oldest = logSequence - log.size() + 1;
+        long first = Math.max(oldest, after + 1);
+        String[] batch = new String[(int) (logSequence - first + 2)];
+        batch[0] = Long.toString(first);
+        int index = 1;
+        long sequence = oldest;
+        for (String entry : log) {
+            if (sequence++ >= first) batch[index++] = entry;
+        }
+        return batch;
+    }
+
     private synchronized void logEvent(String message) {
         if (log.size() == 120) log.removeFirst();
         log.addLast(LocalTime.now().format(LOG_TIME) + "  " + message);
+        logSequence++;
+    }
+
+    private synchronized void startTaskLog(String summary) {
+        log.clear();
+        logSequence = 0;
+        logEvent(summary);
     }
 
     @Override public boolean isGameVibrationMuted() { return gameOpMuted("VIBRATE"); }
@@ -243,8 +265,10 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
         }
 
         renderer = new GpuPreview(WIDTH, HEIGHT);
+        // On Android 17, let the system put this trusted display in its virtual device's power group.
+        int flags = Build.VERSION.SDK_INT >= 37 ? DISPLAY_FLAGS : DISPLAY_FLAGS | OWN_DISPLAY_GROUP;
         VirtualDisplayConfig config = new VirtualDisplayConfig.Builder("Warframe Assistant", WIDTH, HEIGHT, 280)
-                .setFlags(DISPLAY_FLAGS).setSurface(renderer.inputSurface()).build();
+                .setFlags(flags).setSurface(renderer.inputSurface()).build();
         virtualGameDisplay = VirtualGameDisplay.open(shellContext, config, allowed);
         display = virtualGameDisplay.display();
         if (display.getDisplay().getDisplayId() == Display.DEFAULT_DISPLAY
@@ -477,7 +501,7 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
                 phase = RUNNING;
                 List<String> progress = new ArrayList<>();
                 for (GameTaskScheduler.Task task : tasks) progress.add(task.progress());
-                logEvent("开始任务 · " + String.join(" · ", progress));
+                startTaskLog("开始任务 · " + String.join(" · ", progress));
                 pending = worker.schedule(this::scan, 0, TimeUnit.MILLISECONDS);
                 return true;
             } catch (Exception error) {

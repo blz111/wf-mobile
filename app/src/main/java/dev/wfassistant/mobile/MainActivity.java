@@ -2,6 +2,7 @@ package dev.wfassistant.mobile;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.ContentValues;
 import android.content.Intent;
 import android.content.pm.ActivityInfo;
@@ -46,6 +47,7 @@ import android.widget.Spinner;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.io.File;
 import java.io.IOException;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
@@ -322,9 +324,14 @@ public final class MainActivity extends Activity {
         logPanel.setLayoutParams(new LinearLayout.LayoutParams(-1, -1));
         logPanel.setPadding(dp(12), dp(8), dp(12), dp(12));
         logPanel.setBackground(card(Color.WHITE, 12));
+        LinearLayout logHeader = row(logPanel);
+        logHeader.setGravity(Gravity.CENTER_VERTICAL);
+        TextView logTitle = Screen.text(logHeader, "本次日志");
+        logTitle.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
+        Screen.button(logHeader, "历史日志", this::showArchivedLogs);
         ScrollView logScroll = new ScrollView(this);
         logScroll.setFillViewport(true);
-        logPanel.addView(logScroll, new LinearLayout.LayoutParams(-1, -1));
+        logPanel.addView(logScroll, new LinearLayout.LayoutParams(-1, 0, 1));
         LinearLayout logContent = new LinearLayout(this);
         logContent.setOrientation(LinearLayout.VERTICAL);
         logScroll.addView(logContent, new ScrollView.LayoutParams(-1, -2));
@@ -743,6 +750,34 @@ public final class MainActivity extends Activity {
         String content = taskHistory.read();
         if (content.isEmpty()) content = remoteLog == null || remoteLog.isEmpty() ? "暂无任务日志" : remoteLog;
         if (!content.contentEquals(taskLog.getText())) taskLog.setText(content);
+    }
+
+    private void showArchivedLogs() {
+        File[] files = taskHistory.archives();
+        AlertDialog.Builder dialog = new AlertDialog.Builder(this).setTitle("历史日志");
+        if (files.length == 0) {
+            dialog.setMessage("暂无历史日志").setPositiveButton("关闭", null).show();
+            return;
+        }
+        String[] names = new String[files.length];
+        for (int i = 0; i < files.length; i++) names[i] = files[i].getName();
+        dialog.setItems(names, (ignored, index) -> openArchivedLog(files[index]))
+                .setNegativeButton("关闭", null).show();
+    }
+
+    private void openArchivedLog(File file) {
+        try {
+            ScrollView scroll = new ScrollView(this);
+            LinearLayout body = new LinearLayout(this);
+            body.setOrientation(LinearLayout.VERTICAL);
+            body.setPadding(dp(20), 0, dp(20), 0);
+            scroll.addView(body);
+            Screen.text(body, taskHistory.readArchive(file)).setTextIsSelectable(true);
+            new AlertDialog.Builder(this).setTitle(file.getName()).setView(scroll)
+                    .setPositiveButton("关闭", null).show();
+        } catch (IOException error) {
+            Toast.makeText(this, "读取历史日志失败", Toast.LENGTH_SHORT).show();
+        }
     }
 
     private void connectionChanged(ISurvivalSession active, String message) {

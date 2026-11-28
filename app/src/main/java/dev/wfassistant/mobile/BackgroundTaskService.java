@@ -17,6 +17,7 @@ import android.os.RemoteException;
 import android.util.Log;
 import android.widget.Toast;
 
+import java.io.IOException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -34,19 +35,32 @@ public final class BackgroundTaskService extends Service {
     private PowerManager.WakeLock wakeLock;
     private ISurvivalSession session;
     private String header, sessionLog = "";
+    private final StringBuilder taskLog = new StringBuilder();
+    private long logCursor;
     private boolean foreground, finishing;
 
     static void start(Context context, boolean relic, int limit, String macroJson) {
         GameConnection connection = AssistantApplication.connection(context);
         if (!connection.beginBackgroundTask()) return;
+        TaskHistory history = new TaskHistory(context);
+        PowerManager power = context.getSystemService(PowerManager.class);
+        boolean exempt = power.isIgnoringBatteryOptimizations(context.getPackageName());
+        boolean restricted = context.getSystemService(ActivityManager.class).isBackgroundRestricted();
+        try {
+            history.begin("请求启动后台任务 · 系统电池优化" + (exempt ? "已豁免" : "仍开启")
+                    + " · Android 后台限制" + (restricted ? "已启用" : "未启用"));
+        } catch (IOException error) {
+            connection.endBackgroundTask();
+            Toast.makeText(context, "上次日志归档失败，任务未启动", Toast.LENGTH_LONG).show();
+            Log.w("WarframeSurvival", "Could not archive previous task log", error);
+            return;
+        }
         try {
             context.startForegroundService(new Intent(context, BackgroundTaskService.class).setAction(START)
                     .putExtra("relic", relic).putExtra("limit", limit).putExtra("macro", macroJson));
         } catch (RuntimeException error) {
-            TaskHistory history = new TaskHistory(context);
             String reason = "系统拒绝启动后台任务 · " + error.getMessage();
-            history.begin(reason);
-            history.finish(history.read(), "任务未启动");
+            history.finish(history.read(), reason);
             connection.endBackgroundTask();
             Toast.makeText(context, "后台任务启动失败，详情见日志", Toast.LENGTH_LONG).show();
             Log.w("WarframeSurvival", reason, error);
@@ -75,10 +89,6 @@ public final class BackgroundTaskService extends Service {
         if (header != null) return START_NOT_STICKY;
 
         PowerManager power = getSystemService(PowerManager.class);
-        boolean exempt = power.isIgnoringBatteryOptimizations(getPackageName());
-        boolean restricted = getSystemService(ActivityManager.class).isBackgroundRestricted();
-        history.begin("请求启动后台任务 · 系统电池优化" + (exempt ? "已豁免" : "仍开启")
-                + " · Android 后台限制" + (restricted ? "已启用" : "未启用"));
         header = history.read();
         try {
             startForeground(NOTIFICATION_ID, notification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
@@ -147,10 +157,10 @@ public final class BackgroundTaskService extends Service {
     private void readSession(ISurvivalSession active, boolean started) throws RemoteException {
         int phase = active.phase();
         String status = active.status();
-        String log = active.taskLog();
+        String log = started ? collectLog(active) : null;
         main.post(() -> {
             if (finishing) return;
-            sessionLog = log;
+            if (log != null) sessionLog = log;
             if (!started) finish("任务未启动 · " + status);
             else if (phase != VirtualGameSession.RUNNING) finish("后台任务结束 · " + status);
             else {
@@ -158,6 +168,21 @@ public final class BackgroundTaskService extends Service {
                 main.postDelayed(poll, 1_000);
             }
         });
+    }
+
+    private String collectLog(ISurvivalSession active) throws RemoteException {
+        String[] batch = active.taskLogSince(logCursor);
+        if (batch.length == 0) return null;
+        long first = Long.parseLong(batch[0]);
+        if (first > logCursor + 1) appendLog("部分日志超出服务缓冲区 · " + (first - logCursor - 1) + " 条");
+        for (int i = 1; i < batch.length; i++) appendLog(batch[i]);
+        logCursor = first + batch.length - 2;
+        return taskLog.toString();
+    }
+
+    private void appendLog(String entry) {
+        if (taskLog.length() > 0) taskLog.append('\n');
+        taskLog.append(entry);
     }
 
     private void stopSession(ISurvivalSession active) {

@@ -30,7 +30,7 @@ final class GameConnection implements ServiceConnection {
 
     GameConnection(Context context) {
         args = new Shizuku.UserServiceArgs(new ComponentName(context, VirtualGameSession.class))
-                .processNameSuffix("survival_session").daemon(false).version(24);
+                .processNameSuffix("survival_session").daemon(false).version(26);
         Shizuku.addBinderReceivedListenerSticky(() -> main.post(() -> {
             if (listener != null || backgroundTask) connect(false);
         }));
