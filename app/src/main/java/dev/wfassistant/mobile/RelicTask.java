@@ -38,6 +38,11 @@ final class RelicTask implements GameTaskScheduler.Task {
 
     @Override public State state() { return State.SELECTING_RELIC; }
 
+    @Override public void resumeAfterTakeover() {
+        stage = Stage.EQUIP;
+        nextEquipRetryAt = nextNoRelicRetryAt = confirmationDeadline = nextConfirmRetryAt = nextDismissRetryAt = 0;
+    }
+
     @Override public Step run(State state, Bitmap frame, Tap tap) throws Exception {
         if (state == State.NORMAL) return step(Decision.WAIT, "等待选核桃页面");
         Confirmation confirmation = recognition.relicConfirmation(frame);

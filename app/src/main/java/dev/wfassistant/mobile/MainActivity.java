@@ -60,7 +60,7 @@ import java.util.function.Consumer;
 
 public final class MainActivity extends Activity {
     private static final int REQUEST_NOTIFICATIONS = 1;
-    private static final int TASK_TAB = 0, MACRO_TAB = 1, LOG_TAB = 2;
+    private static final int TASK_TAB = 0, MACRO_TAB = 1, TAKEOVER_TAB = 2, LOG_TAB = 3;
     private static final int INK = 0xff18312c, ACCENT = 0xff216958, PALE = 0xffe1eee8;
     private final Handler ui = new Handler(Looper.getMainLooper());
     private final ExecutorService statusWorker = Executors.newSingleThreadExecutor();
@@ -69,6 +69,7 @@ public final class MainActivity extends Activity {
     private TaskHistory taskHistory;
     private ISurvivalSession session;
     private boolean visible, polling, expanded, touching, saving, hasGameFrame;
+    private boolean takeoverActive, takeoverSwitching;
     private final boolean[] feedbackBusy = new boolean[2];
     private final Boolean[] feedbackMuted = new Boolean[2];
     private int phase = VirtualGameSession.CLOSED;
@@ -79,9 +80,10 @@ public final class MainActivity extends Activity {
     private Surface previewSurface;
     private int previewWidth, previewHeight;
     private Button authorize, launch, close, start, screenshot, lockScreen, vibration, audio, quickOptions;
-    private Button battery, notifications;
-    private final Button[] tabs = new Button[3];
-    private final LinearLayout[] panels = new LinearLayout[3];
+    private Button battery, notifications, takeoverButton;
+    private VirtualGamepadView gamepad;
+    private final Button[] tabs = new Button[4];
+    private final LinearLayout[] panels = new LinearLayout[4];
     private LinearLayout tabContent, relicSettings, macroSettings, quickPanel, footer;
     private TextView relicLabel, macroLabel;
     private CheckBox relicTask, macroTask;
@@ -112,6 +114,7 @@ public final class MainActivity extends Activity {
     @Override protected void onStart() {
         super.onStart();
         visible = true;
+        updateTakeoverControls();
         gameConnection.connect(false);
         updatePreviewSurface();
         refreshTaskLog(null);
@@ -127,6 +130,8 @@ public final class MainActivity extends Activity {
     @Override protected void onStop() {
         endGesture();
         visible = false;
+        updateTakeoverControls();
+        if (takeoverActive) call(ISurvivalSession::releaseManualGamepad);
         updatePreviewSurface();
         ui.removeCallbacks(nextPoll);
         super.onStop();
@@ -147,6 +152,7 @@ public final class MainActivity extends Activity {
     @Override public void onWindowFocusChanged(boolean focused) {
         super.onWindowFocusChanged(focused);
         if (focused) applySystemBars();
+        else if (gamepad != null) gamepad.releaseAll();
     }
 
     private void buildUi() {
@@ -262,11 +268,12 @@ public final class MainActivity extends Activity {
         LinearLayout tabBar = row(body);
         tabBar.setBackground(card(PALE, 12));
         tabBar.setPadding(dp(4), dp(4), dp(4), dp(4));
-        String[] titles = {"一键挂机", "宏配置", "日志"};
+        String[] titles = {"一键挂机", "宏配置", "手动接管", "日志"};
         for (int i = 0; i < titles.length; i++) {
             int tab = i;
             tabs[i] = rowButton(tabBar, titles[i], () -> showTab(tab));
             tabs[i].setMinHeight(dp(42));
+            tabs[i].setPadding(dp(4), 0, dp(4), 0);
         }
         tabContent = column(body);
         tabContent.setPadding(0, dp(10), 0, dp(8));
@@ -308,7 +315,7 @@ public final class MainActivity extends Activity {
         Screen.button(macroSettings, "编辑宏", () -> showTab(MACRO_TAB));
         selectTask(false);
 
-        macroEditor = new MacroEditor(panels[MACRO_TAB], this::pickPoint, this::refreshMacroPicker);
+        macroEditor = new MacroEditor(panels[MACRO_TAB], this::pickPoint, this::refreshMacroPicker, this::macroDeleted);
         refreshMacroPicker(getPreferences(MODE_PRIVATE).getInt("selected_macro", 0));
         macroPicker.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
             @Override public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
@@ -319,6 +326,25 @@ public final class MainActivity extends Activity {
 
             @Override public void onNothingSelected(AdapterView<?> parent) {}
         });
+
+        LinearLayout takeoverPanel = panels[TAKEOVER_TAB];
+        takeoverButton = Screen.button(takeoverPanel, "开始接管", this::toggleTakeover);
+        takeoverButton.setTextColor(Color.WHITE);
+        takeoverButton.setBackgroundTintList(android.content.res.ColorStateList.valueOf(ACCENT));
+        gamepad = new VirtualGamepadView(this, new VirtualGamepadView.Listener() {
+            @Override public void key(int code, boolean pressed) {
+                call(service -> service.manualGamepadKey(code, pressed));
+            }
+
+            @Override public void stick(boolean right, float x, float y) {
+                call(service -> service.manualGamepadStick(right, x, y));
+            }
+
+            @Override public void release() { call(ISurvivalSession::releaseManualGamepad); }
+        });
+        LinearLayout.LayoutParams padSize = new LinearLayout.LayoutParams(-1, -2);
+        padSize.topMargin = dp(8);
+        takeoverPanel.addView(gamepad, padSize);
 
         LinearLayout logPanel = panels[LOG_TAB];
         logPanel.setLayoutParams(new LinearLayout.LayoutParams(-1, -1));
@@ -410,6 +436,7 @@ public final class MainActivity extends Activity {
             quickPanel.setVisibility(View.GONE);
             quickOptions.setText("快捷选项");
         }
+        updateTakeoverControls();
         if (tab == LOG_TAB) {
             compact.scrollTo(0, 0);
             refreshTaskLog(null);
@@ -428,6 +455,41 @@ public final class MainActivity extends Activity {
         }
     }
 
+    private void toggleTakeover() {
+        ISurvivalSession active = session;
+        if (active == null || takeoverSwitching) return;
+        boolean enable = !takeoverActive;
+        takeoverSwitching = true;
+        updateTakeoverControls();
+        statusWorker.execute(() -> {
+            try {
+                boolean accepted = active.setManualTakeover(enable);
+                boolean current = active.manualTakeover();
+                String status = active.status();
+                ui.post(() -> {
+                    if (session != active) return;
+                    takeoverActive = current;
+                    takeoverSwitching = false;
+                    showStatus(status);
+                    updateControls();
+                    if (!accepted) Toast.makeText(this, enable ? "暂时无法接管游戏" : "释放手柄输入失败，请重试",
+                            Toast.LENGTH_SHORT).show();
+                });
+            } catch (RemoteException error) {
+                ui.post(() -> {
+                    if (session == active) gameConnection.disconnected("Shizuku 用户服务已断开");
+                });
+            } catch (RuntimeException error) {
+                ui.post(() -> {
+                    if (session != active) return;
+                    takeoverSwitching = false;
+                    showStatus("手动接管切换失败 · " + error.getMessage());
+                    updateControls();
+                });
+            }
+        });
+    }
+
     private void refreshMacroPicker(int index) {
         int requested = index >= 0 ? index : macroPicker.getSelectedItemPosition();
         List<String> names = new ArrayList<>();
@@ -437,6 +499,11 @@ public final class MainActivity extends Activity {
         macroPicker.setSelection(selected);
         getPreferences(MODE_PRIVATE).edit().putInt("selected_macro", selected).apply();
         if (start != null) updateControls();
+    }
+
+    private void macroDeleted(int removed) {
+        int selected = macroPicker.getSelectedItemPosition();
+        refreshMacroPicker(Math.max(0, selected > removed ? selected - 1 : selected));
     }
 
     private GradientDrawable card(int color, int radius) {
@@ -507,6 +574,7 @@ public final class MainActivity extends Activity {
             smallPreview.addView(preview, new FrameLayout.LayoutParams(-1, -1));
         }
         compact.setVisibility(show ? View.GONE : View.VISIBLE);
+        updateTakeoverControls();
         fullPreview.setVisibility(show ? View.VISIBLE : View.GONE);
         applySystemBars();
         setRequestedOrientation(show ? ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
@@ -645,12 +713,14 @@ public final class MainActivity extends Activity {
         statusWorker.execute(() -> {
             try {
                 int currentPhase = active.phase();
+                boolean takingOver = active.manualTakeover();
                 String message = active.status();
                 boolean frameAvailable = currentPhase != VirtualGameSession.CLOSED && active.hasFrame();
                 String log = readLog ? active.taskLog() : null;
                 ui.post(() -> {
                     if (session != active || !visible) return;
                     phase = currentPhase;
+                    takeoverActive = takingOver;
                     if (showStatus(message) && expanded && message.startsWith("操作失败")) {
                         Toast.makeText(this, message, Toast.LENGTH_SHORT).show();
                     }
@@ -782,6 +852,8 @@ public final class MainActivity extends Activity {
 
     private void connectionChanged(ISurvivalSession active, String message) {
         if (session != active) {
+            takeoverActive = false;
+            takeoverSwitching = false;
             session = active;
             touching = hasGameFrame = false;
             phase = VirtualGameSession.CLOSED;
@@ -808,7 +880,8 @@ public final class MainActivity extends Activity {
         authorize.setEnabled(!gameConnection.bound());
         launch.setEnabled(connected && phase == VirtualGameSession.CLOSED);
         close.setEnabled(connected && phase != VirtualGameSession.CLOSED);
-        start.setEnabled(connected && (running || phase == VirtualGameSession.READY
+        start.setEnabled(connected && (running || phase == VirtualGameSession.READY && !takeoverActive
+                && !takeoverSwitching
                 && !gameConnection.hasBackgroundTask() && (relicTask.isChecked() || macroTask.isChecked())));
         start.setAlpha(start.isEnabled() ? 1 : 0.55f);
         start.setText(running ? "停止任务" : "开始任务");
@@ -818,8 +891,18 @@ public final class MainActivity extends Activity {
         macroPicker.setEnabled(!running && !macroEditor.macros().isEmpty());
         screenshot.setEnabled(hasFrame && !saving);
         lockScreen.setEnabled(connected);
+        updateTakeoverControls();
         feedbackButton(vibration, 0, "震动", connected);
         feedbackButton(audio, 1, "声音", connected);
+    }
+
+    private void updateTakeoverControls() {
+        boolean ready = session != null && (phase == VirtualGameSession.READY || phase == VirtualGameSession.RUNNING);
+        takeoverButton.setEnabled(ready && !takeoverSwitching);
+        takeoverButton.setAlpha(takeoverButton.isEnabled() ? 1 : 0.55f);
+        takeoverButton.setText(takeoverSwitching ? "正在切换…" : takeoverActive ? "停止接管" : "开始接管");
+        gamepad.setInteractive(ready && takeoverActive && !takeoverSwitching && visible && !expanded
+                && activeTab == TAKEOVER_TAB);
     }
 
     private void feedbackButton(Button button, int type, String name, boolean connected) {

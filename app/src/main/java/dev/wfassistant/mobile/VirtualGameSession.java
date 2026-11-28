@@ -40,6 +40,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.ScheduledFuture;
@@ -83,6 +84,8 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
     private long logSequence;
     private volatile String message = "Shizuku 已连接";
     private volatile int phase = CLOSED;
+    private volatile boolean manualTakeover;
+    private final ControllerInput manualController = new ControllerInput();
     private VirtualDisplay display;
     private VirtualGameDisplay virtualGameDisplay;
     private volatile GpuPreview renderer;
@@ -126,6 +129,7 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
 
     @Override public String status() { return message; }
     @Override public int phase() { return phase; }
+    @Override public boolean manualTakeover() { return manualTakeover; }
 
     @Override public synchronized String taskLog() { return String.join("\n", log); }
 
@@ -482,8 +486,8 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
     }
 
     @Override public boolean startSurvival(boolean relicEnabled, int limit, String macroJson) {
-        FutureTask<Boolean> request = new FutureTask<>(() -> {
-            if (phase != READY) return false;
+        return requestOnWorker(() -> {
+            if (phase != READY || manualTakeover) return false;
             if (limit < 0) {
                 message = "开核桃数需要是非负整数";
                 return false;
@@ -509,6 +513,78 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
                 return false;
             }
         });
+    }
+
+    @Override public boolean setManualTakeover(boolean enabled) {
+        return requestOnWorker(() -> {
+            if (manualTakeover == enabled) return true;
+            try {
+                if (enabled) {
+                    if ((phase != READY && phase != RUNNING) || releasingTasks != null) return false;
+                    checkTarget();
+                    if (taskScheduler != null) {
+                        taskScheduler.pauseNormalTasks();
+                        cancelPending();
+                    }
+                    cancelTouches();
+                    manualTakeover = true;
+                    message = taskScheduler == null ? "手动接管中" : "手动接管中 · 任务已暂停";
+                } else {
+                    manualController.reset();
+                    cancelTouches();
+                    manualTakeover = false;
+                    if (taskScheduler != null) {
+                        taskScheduler.resumeAfterTakeover();
+                        pending = worker.schedule(this::scan, 0, TimeUnit.MILLISECONDS);
+                    }
+                    message = taskScheduler == null ? "手动接管已结束" : "手动接管已结束 · 恢复任务";
+                }
+                logEvent(message);
+                return true;
+            } catch (Exception error) {
+                report(error);
+                return false;
+            }
+        });
+    }
+
+    @Override public void manualGamepadKey(int keyCode, boolean pressed) {
+        if (SkillMacro.keyIndex(keyCode) < 0) return;
+        runManualInput(() -> {
+            if (pressed) manualController.pressKey(keyCode);
+            else manualController.releaseKey(keyCode);
+        });
+    }
+
+    @Override public void manualGamepadStick(boolean right, float x, float y) {
+        if (!Float.isFinite(x) || !Float.isFinite(y) || Math.hypot(x, y) > 1.01) return;
+        StickPosition position = new StickPosition(x, y);
+        runManualInput(() -> manualController.moveStick(
+                right ? SkillMacro.Stick.RIGHT : SkillMacro.Stick.LEFT, position));
+    }
+
+    @Override public void releaseManualGamepad() {
+        runManualInput(manualController::reset);
+    }
+
+    @FunctionalInterface
+    private interface ManualInput {
+        void run() throws Exception;
+    }
+
+    private void runManualInput(ManualInput input) {
+        worker.execute(() -> {
+            if (!manualTakeover) return;
+            try {
+                input.run();
+            } catch (Exception error) {
+                report(error);
+            }
+        });
+    }
+
+    private boolean requestOnWorker(Callable<Boolean> action) {
+        FutureTask<Boolean> request = new FutureTask<>(action);
         worker.execute(request);
         try {
             return request.get();
@@ -517,29 +593,23 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
             Thread.currentThread().interrupt();
             return false;
         } catch (ExecutionException error) {
-            Log.e("WarframeSurvival", "Could not start task", error);
+            Log.e("WarframeSurvival", "Worker request failed", error);
             return false;
         }
     }
 
     private final class MacroInput implements MacroTask.Input {
-        private final Map<Integer, Long> keysDown = new LinkedHashMap<>();
-        private SkillMacro.Direction left, right;
+        private final ControllerInput controller = new ControllerInput();
 
-        @Override public boolean isIdle() { return !manualTouchActive(); }
+        @Override public boolean isIdle() { return !manualTakeover && !manualTouchActive(); }
 
         @Override public boolean press(SkillMacro.Action action) throws Exception {
             if (phase != RUNNING || !isIdle()) return false;
             checkTarget();
             switch (action.kind()) {
-                case GAMEPAD, GAMEPAD_DOWN -> {
-                    if (!keysDown.containsKey(action.key())) {
-                        long downTime = SystemClock.uptimeMillis();
-                        sendGamepad(KeyEvent.ACTION_DOWN, action.key(), downTime);
-                        keysDown.put(action.key(), downTime);
-                    }
-                }
-                case JOYSTICK, JOYSTICK_MOVE -> moveStick(action.stick(), action.direction());
+                case GAMEPAD, GAMEPAD_DOWN -> controller.pressKey(action.key());
+                case JOYSTICK, JOYSTICK_MOVE -> controller.moveStick(action.stick(),
+                        new StickPosition(action.direction().x, action.direction().y));
                 case TAP, HOLD -> sendPoint(MotionEvent.ACTION_DOWN, new Point(action.x(), action.y()));
                 default -> throw new IllegalArgumentException("此动作无需按下");
             }
@@ -548,11 +618,29 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
 
         @Override public void release(SkillMacro.Action action) throws Exception {
             switch (action.kind()) {
-                case GAMEPAD, GAMEPAD_UP -> releaseKey(action.key());
-                case JOYSTICK, JOYSTICK_CENTER -> moveStick(action.stick(), null);
+                case GAMEPAD, GAMEPAD_UP -> controller.releaseKey(action.key());
+                case JOYSTICK, JOYSTICK_CENTER -> controller.moveStick(action.stick(), StickPosition.CENTER);
                 case TAP, HOLD -> sendPoint(MotionEvent.ACTION_UP, new Point(action.x(), action.y()));
                 default -> throw new IllegalArgumentException("此动作无需松开");
             }
+        }
+
+        @Override public void resetController() throws Exception { controller.reset(); }
+    }
+
+    private record StickPosition(float x, float y) {
+        private static final StickPosition CENTER = new StickPosition(0, 0);
+    }
+
+    private final class ControllerInput {
+        private final Map<Integer, Long> keysDown = new LinkedHashMap<>();
+        private StickPosition left = StickPosition.CENTER, right = StickPosition.CENTER;
+
+        private void pressKey(int key) throws Exception {
+            if (keysDown.containsKey(key)) return;
+            long downTime = SystemClock.uptimeMillis();
+            sendGamepad(KeyEvent.ACTION_DOWN, key, downTime);
+            keysDown.put(key, downTime);
         }
 
         private void releaseKey(int key) throws Exception {
@@ -562,17 +650,18 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
             keysDown.remove(key);
         }
 
-        private void moveStick(SkillMacro.Stick stick, SkillMacro.Direction direction) throws Exception {
-            SkillMacro.Direction nextLeft = stick == SkillMacro.Stick.LEFT ? direction : left;
-            SkillMacro.Direction nextRight = stick == SkillMacro.Stick.RIGHT ? direction : right;
-            if (nextLeft == left && nextRight == right) return;
+        private void moveStick(SkillMacro.Stick stick, StickPosition position) throws Exception {
+            StickPosition nextLeft = stick == SkillMacro.Stick.LEFT ? position : left;
+            StickPosition nextRight = stick == SkillMacro.Stick.RIGHT ? position : right;
+            if (nextLeft.equals(left) && nextRight.equals(right)) return;
             sendJoystick(nextLeft, nextRight);
             left = nextLeft;
             right = nextRight;
         }
 
-        @Override public void resetController() throws Exception {
-            if (keysDown.isEmpty() && left == null && right == null) return;
+        private void reset() throws Exception {
+            boolean sticksMoved = !left.equals(StickPosition.CENTER) || !right.equals(StickPosition.CENTER);
+            if (keysDown.isEmpty() && !sticksMoved) return;
             IOException failure = new IOException("释放手柄输入失败");
             for (int key : List.copyOf(keysDown.keySet())) {
                 try {
@@ -581,22 +670,27 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
                     failure.addSuppressed(error);
                 }
             }
-            if (left != null || right != null) {
+            if (sticksMoved) {
                 try {
-                    sendJoystick(null, null);
-                    left = right = null;
+                    sendJoystick(StickPosition.CENTER, StickPosition.CENTER);
+                    left = right = StickPosition.CENTER;
                 } catch (Exception error) {
                     failure.addSuppressed(error);
                 }
             }
             if (failure.getSuppressed().length > 0) throw failure;
         }
+
+        private void clear() {
+            keysDown.clear();
+            left = right = StickPosition.CENTER;
+        }
     }
 
     private void scan() {
         pending = null;
         GameTaskScheduler scheduler = taskScheduler;
-        if (scheduler == null) return;
+        if (scheduler == null || manualTakeover) return;
         if (scheduler.waitingForRelease() && manualTouchActive()) {
             pending = worker.schedule(this::scan, GameTaskScheduler.INTERACTION_INTERVAL_MS, TimeUnit.MILLISECONDS);
             return;
@@ -830,15 +924,15 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
         injectToGame(event, gameUid);
     }
 
-    private void sendJoystick(SkillMacro.Direction left, SkillMacro.Direction right) throws Exception {
+    private void sendJoystick(StickPosition left, StickPosition right) throws Exception {
         MotionEvent.PointerProperties pointer = new MotionEvent.PointerProperties();
         pointer.id = 0;
         pointer.toolType = MotionEvent.TOOL_TYPE_UNKNOWN;
         MotionEvent.PointerCoords axes = new MotionEvent.PointerCoords();
-        axes.setAxisValue(MotionEvent.AXIS_X, left == null ? 0 : left.x);
-        axes.setAxisValue(MotionEvent.AXIS_Y, left == null ? 0 : left.y);
-        axes.setAxisValue(MotionEvent.AXIS_Z, right == null ? 0 : right.x);
-        axes.setAxisValue(MotionEvent.AXIS_RZ, right == null ? 0 : right.y);
+        axes.setAxisValue(MotionEvent.AXIS_X, left.x());
+        axes.setAxisValue(MotionEvent.AXIS_Y, left.y());
+        axes.setAxisValue(MotionEvent.AXIS_Z, right.x());
+        axes.setAxisValue(MotionEvent.AXIS_RZ, right.y());
         long now = SystemClock.uptimeMillis();
         MotionEvent event = MotionEvent.obtain(now, now, MotionEvent.ACTION_MOVE, 1,
                 new MotionEvent.PointerProperties[]{pointer}, new MotionEvent.PointerCoords[]{axes},
@@ -1014,6 +1108,15 @@ public final class VirtualGameSession extends ISurvivalSession.Stub {
         detachTasks();
         tryReleaseTaskInputs();
         releasingTasks = null;
+        if (manualTakeover) {
+            try {
+                manualController.reset();
+            } catch (Exception error) {
+                Log.w("WarframeSurvival", "Could not release manual gamepad", error);
+            }
+            manualController.clear();
+            manualTakeover = false;
+        }
         cancelTouches();
         phase = CLOSED;
         if (virtualGameDisplay != null) virtualGameDisplay.close();

@@ -46,8 +46,8 @@ final class MacroEditor {
 
     private final Context context;
     private final PointPicker pointPicker;
-    private final IntConsumer onSaved;
-    private final Button picker, saveButton, exportButton;
+    private final IntConsumer onSaved, onDeleted;
+    private final Button picker, saveButton, exportButton, deleteButton;
     private final TextView actionCount;
     private final EditText name;
     private final LinearLayout steps;
@@ -56,10 +56,11 @@ final class MacroEditor {
     private int editing = -1;
     private final boolean loadFailed;
 
-    MacroEditor(LinearLayout panel, PointPicker pointPicker, IntConsumer onSaved) {
+    MacroEditor(LinearLayout panel, PointPicker pointPicker, IntConsumer onSaved, IntConsumer onDeleted) {
         context = panel.getContext();
         this.pointPicker = pointPicker;
         this.onSaved = onSaved;
+        this.onDeleted = onDeleted;
         String loadError = null;
         try {
             macros = SkillMacro.load(context);
@@ -90,8 +91,10 @@ final class MacroEditor {
         LinearLayout editorHeader = row(editor, 0);
         TextView nameLabel = text("宏名称", 18, INK, true);
         editorHeader.addView(nameLabel, new LinearLayout.LayoutParams(0, -2, 1));
+        deleteButton = button("删除宏", 0xfffcebe8, 0xffa12f23, this::confirmDelete);
+        editorHeader.addView(deleteButton, new LinearLayout.LayoutParams(-2, dp(48)));
         saveButton = button("保存宏", ACCENT, Color.WHITE, this::save);
-        editorHeader.addView(saveButton, new LinearLayout.LayoutParams(-2, dp(48)));
+        addTrailing(editorHeader, saveButton);
         name = new EditText(context);
         name.setId(View.generateViewId());
         nameLabel.setLabelFor(name.getId());
@@ -380,6 +383,30 @@ final class MacroEditor {
                 && draft.stream().anyMatch(action -> action.kind() != SkillMacro.Kind.WAIT);
         saveButton.setEnabled(!loadFailed && complete && hasChanges());
         exportButton.setEnabled(complete);
+        deleteButton.setEnabled(!loadFailed && editing >= 0);
+    }
+
+    private void confirmDelete() {
+        if (loadFailed || editing < 0) return;
+        int selected = editing;
+        new AlertDialog.Builder(context).setTitle("删除宏")
+                .setMessage("删除「" + macros.get(selected).name() + "」？")
+                .setNegativeButton("取消", null)
+                .setPositiveButton("删除", (dialog, which) -> delete(selected)).show();
+    }
+
+    private void delete(int selected) {
+        try {
+            List<SkillMacro> updated = new ArrayList<>(macros);
+            updated.remove(selected);
+            SkillMacro.save(context, updated);
+            macros = updated;
+            edit(Math.min(selected, macros.size() - 1));
+            onDeleted.accept(selected);
+            toast("已删除宏");
+        } catch (Exception error) {
+            toast("删除失败 · " + error.getMessage());
+        }
     }
 
     private void save() {

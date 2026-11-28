@@ -22,5 +22,10 @@ interface ISurvivalSession {
     void lockScreen() = 15;
     // First element is the sequence number of the first returned entry.
     String[] taskLogSince(long after) = 16;
+    boolean manualTakeover() = 17;
+    boolean setManualTakeover(boolean enabled) = 18;
+    void manualGamepadKey(int keyCode, boolean pressed) = 19;
+    void manualGamepadStick(boolean right, float x, float y) = 20;
+    void releaseManualGamepad() = 21;
     void destroy() = 16777114;
 }

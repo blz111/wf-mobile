@@ -31,6 +31,7 @@ final class GameTaskScheduler {
         Step run(State state, Bitmap frame, Tap tap) throws Exception;
         String progress();
         default void pause() throws Exception {}
+        default void resumeAfterTakeover() {}
     }
 
     private final List<Task> tasks;
@@ -96,6 +97,13 @@ final class GameTaskScheduler {
 
     void pauseNormalTasks() throws Exception {
         for (Task task : tasks) if (task.state() == State.NORMAL) task.pause();
+    }
+
+    void resumeAfterTakeover() {
+        state = State.NORMAL;
+        screenOwner = null;
+        waitingForRelease = false;
+        for (Task task : tasks) task.resumeAfterTakeover();
     }
 
     String stopMessage() {
